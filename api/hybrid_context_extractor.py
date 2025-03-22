@@ -2,6 +2,7 @@ import re
 import numpy as np
 from transformers import AutoTokenizer, AutoModel
 import torch
+from langchain_core.documents import Document
 
 # Инициализация модели и токенизатора
 MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
@@ -55,3 +56,41 @@ def hybrid_extract_context(query, chunks, top_k=2, weight_transformer=0.7, weigh
     selected_chunks = [chunks[i] for i in top_indices]
 
     return selected_chunks
+class HybridRetriever:
+    def __init__(self, base_retriever):
+        self.base_retriever = base_retriever
+
+    def __call__(self, query, chat_history=""):
+        # Если query пришёл как словарь, извлекаем текст из поля "input"
+        if isinstance(query, dict):
+            query = query.get("input", "")
+        # Получаем первоначальные результаты от базового retriever
+        initial_chunks = self.base_retriever.invoke({"input": query, "chat_history": chat_history})
+        # Преобразуем каждый элемент в строку: если это объект Document (или dict) с полем page_content, берем его
+        texts = []
+        for chunk in initial_chunks:
+            if isinstance(chunk, dict):
+                texts.append(chunk.get("page_content", str(chunk)))
+            elif hasattr(chunk, "page_content"):
+                texts.append(chunk.page_content)
+            else:
+                texts.append(str(chunk))
+
+        # Применяем гибридное извлечение для уточнения контекста
+        refined_chunks = hybrid_extract_context(query, texts)
+
+        # Сохраняем объединённый контекст
+        self.last_context = "\n\n".join(refined_chunks)
+
+        # Оборачиваем каждую строку в объект Document с пустыми метаданными
+        refined_docs = [Document(page_content=txt, metadata={}) for txt in refined_chunks]
+        return refined_docs
+
+    def similarity_search(self, query: str, **kwargs):
+        # Если есть chat_history в kwargs, извлекаем его, иначе – пустая строка
+        chat_history = kwargs.get("chat_history", "")
+        return self.__call__(query, chat_history)
+
+    def with_config(self, **kwargs):
+        # Если нужна дополнительная конфигурация, здесь можно её добавить
+        return self
