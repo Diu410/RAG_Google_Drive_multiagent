@@ -14,7 +14,7 @@ from langchain_core.documents import Document #Используется, что�
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200, length_function=len)
 #chunk_overlap - Это насколько чанки текста будут залазить друг на друга (пересекаться)
 
-# embedding_function = SentenceTransformerEmbeddings(model_name="all-mpnet-base-v2")
+#embedding_function = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 embedding_function = HuggingFaceEmbeddings(model_name="all-mpnet-base-v2")
 
 

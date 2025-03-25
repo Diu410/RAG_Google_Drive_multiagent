@@ -7,7 +7,7 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from hybrid_context_extractor import HybridRetriever
 from chroma_utils import vectorstore
 
-retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+retriever = vectorstore.as_retriever(search_kwargs={"k": 20})
 #vectorstore преобразуется в retriever – компонент, который по запросу будет возвращать релевантные фрагменты документов.
 
 

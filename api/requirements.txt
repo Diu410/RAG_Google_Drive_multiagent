@@ -13,3 +13,4 @@ transformers
 torch
 numpy
 nltk
+spacy
