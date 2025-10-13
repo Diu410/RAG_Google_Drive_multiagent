@@ -1,0 +1,17 @@
+*.env
+.env
+config/keys.json
+api/token.json
+credentials.json
+config/local.py
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.idea/
+*.log
+logs/
+*.tmp
+*.sqlite
