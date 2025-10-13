@@ -1,21 +1,23 @@
-import requests #Библиотека для отправки HTTP-запросов. Через него мы связываемся с нашим api
-import streamlit as st #Через него мы создаём веб приложение. Конкретно тут для отображения ошибок
+import requests
+import streamlit as st
 
-"""Тут описаны как мы отправляем запросы на наш Api и как мы получаем ответы"""
-def get_api_response(question, session_id, model):
-    headers = { #HTTP-загаловок
+"""Функции для взаимодействия с API FastAPI."""
+# Изменение: Обновлено описание модуля
+def get_api_response(question, session_id, model, use_multi_agent=False):  # <-- Добавь arg
+    headers = {
         'accept': 'application/json',
         'Content-Type': 'application/json'
     }
     data = {
         "question": question,
-        "model": model
+        "model": model,
+        "use_multi_agent": use_multi_agent  # <-- Добавь флаг в data
     }
     if session_id:
         data["session_id"] = session_id
 
     try:
-        response = requests.post("http://localhost:8000/chat", headers=headers, json=data) #Отправляем POST запрос.
+        response = requests.post("http://localhost:8000/query", headers=headers, json=data)
         if response.status_code == 200:
             return response.json()
         else:
@@ -26,9 +28,11 @@ def get_api_response(question, session_id, model):
         return None
 
 def upload_document(file):
+    """Загружает локальный файл (PDF, DOCX, HTML) на сервер."""
     print("Uploading file...")
     try:
-        files = {"file": (file.name, file, file.type)}
+        # Multipart для файлов (не JSON!)
+        files = {"file": (file.name, file, file.type)}  # file — UploadedFile из Streamlit
         response = requests.post("http://localhost:8000/upload-doc", files=files)
         if response.status_code == 200:
             return response.json()
@@ -38,6 +42,7 @@ def upload_document(file):
     except Exception as e:
         st.error(f"An error occurred while uploading the file: {str(e)}")
         return None
+
 
 def list_documents():
     try:
@@ -67,4 +72,28 @@ def delete_document(file_id):
             return None
     except Exception as e:
         st.error(f"An error occurred while deleting the document: {str(e)}")
+        return None
+
+def upload_gdrive_folder(folder_url):
+    """Отправляет URL папки Google Drive в API для обработки."""
+    headers = {
+        'accept': 'application/json',
+        'Content-Type': 'application/json'
+    }
+    data = {"folder_url": folder_url}
+
+    try:
+        # ТОЧНО /upload-gdrive (без -folder!)
+        response = requests.post("http://localhost:8000/upload-gdrive", headers=headers, json=data)
+        response.raise_for_status()  # Авто-error на 4xx/5xx
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"Failed to upload Google Drive folder. Error: {response.status_code} - {response.text}")
+            return None
+    except requests.exceptions.HTTPError as e:
+        st.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
+        return None
+    except Exception as e:
+        st.error(f"An error occurred while uploading the Google Drive folder: {str(e)}")
         return None

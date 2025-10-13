@@ -11,18 +11,20 @@ def display_chat_interface():
 
     #Пользователь вводит запрос и мы добавляем его в историю чата
     if prompt := st.chat_input("Query:"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
+        st.session_state.messages.append({"role": " ", "content": prompt})
+        with st.chat_message(" "):
             st.markdown(prompt)
 
         with st.spinner("Generating response..."): #Временное сообщение пока ии думает
-            response = get_api_response(prompt, st.session_state.session_id, st.session_state.model)
+            use_multi = st.session_state.get("use_multi_agent", False)
+            response = get_api_response(prompt, st.session_state.session_id, st.session_state.model,
+                                        use_multi)
 
             if response:
                 st.session_state.session_id = response.get('session_id')
-                st.session_state.messages.append({"role": "assistant", "content": response['answer']})
+                st.session_state.messages.append({"role": " ", "content": response['answer']})
 
-                with st.chat_message("assistant"): #Добавляем ответ ИИ
+                with st.chat_message(" "): #Добавляем ответ ИИ
                     st.markdown(response['answer'])
 
                     with st.expander("Details"): #Доп. Информация для откладки
