@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "scripts": {
+    "frontend:dev": "npm --prefix frontend run dev",
+    "backend:dev": ".venv\\Scripts\\python.exe -m uvicorn main:app --app-dir api --host 127.0.0.1 --port 8000 --reload",
+    "desktop:dev": "npm --prefix frontend run desktop:dev",
+    "desktop:build": "npm --prefix frontend run desktop:build"
+  }
+}

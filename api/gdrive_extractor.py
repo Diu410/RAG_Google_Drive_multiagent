@@ -6,6 +6,7 @@ import os
 import re
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, UnstructuredHTMLLoader,TextLoader
 from langchain_core.documents import Document
+from formula_processing import load_docx_with_formulas, load_html_with_formulas, load_pdf_complete
 from typing import List, Tuple
 import tempfile
 import logging
@@ -41,12 +42,17 @@ class GoogleDriveExtractor:
         logger.info(f"Listing files and folders in folder with ID: {folder_id}")
         try:
             query = f"'{folder_id}' in parents and trashed=false"
-            results = self.service.files().list(
-                q=query,
-                fields="files(id, name, mimeType)",
-                pageSize=1000
-            ).execute()
-            items = results.get('files', [])
+            items = []
+            page_token = None
+            while True:
+                results = self.service.files().list(
+                    q=query, fields="nextPageToken,files(id,name,mimeType)",
+                    pageSize=1000, pageToken=page_token,
+                ).execute()
+                items.extend(results.get('files', []))
+                page_token = results.get('nextPageToken')
+                if not page_token:
+                    break
             logger.info(f"Found {len(items)} items (files and folders) in folder {folder_id}")
             return items
         except Exception as e:
@@ -61,7 +67,11 @@ class GoogleDriveExtractor:
             file_name = file_metadata['name']
             logger.info(f"File name: {file_name}")
 
-            request = self.service.files().get_media(fileId=file_id)
+            if file_metadata['mimeType'] == 'application/vnd.google-apps.document':
+                request = self.service.files().export_media(fileId=file_id, mimeType='text/plain')
+                file_name += '.txt'
+            else:
+                request = self.service.files().get_media(fileId=file_id)
             file_buffer = io.BytesIO()
             downloader = MediaIoBaseDownload(file_buffer, request)
             done = False
@@ -77,6 +87,7 @@ class GoogleDriveExtractor:
 
     def extract_text(self, file_buffer: io.BytesIO, file_name: str) -> List[Document]:
         logger.info(f"Extracting text from {file_name}")
+        temp_file_path = None
         try:
             extension = os.path.splitext(file_name)[1].lower()
             logger.info(f"File extension: {extension}")
@@ -86,24 +97,24 @@ class GoogleDriveExtractor:
                 return []
 
             # Temp file
-            temp_file_path = tempfile.mktemp(suffix=extension)
-            with open(temp_file_path, 'wb') as f:
+            with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as f:
+                temp_file_path = f.name
                 f.write(file_buffer.getvalue())
 
             if extension == '.pdf':
-                loader = PyPDFLoader(temp_file_path)
+                documents = load_pdf_complete(temp_file_path)
             elif extension == '.docx':
-                loader = Docx2txtLoader(temp_file_path)
+                documents = load_docx_with_formulas(temp_file_path)
             elif extension == '.html':
-                loader = UnstructuredHTMLLoader(temp_file_path)
+                documents = load_html_with_formulas(temp_file_path)
             elif extension == '.txt':  # <-- Добавь это
                 from langchain_community.document_loaders import TextLoader  # Импорт внутри или в начало
                 loader = TextLoader(temp_file_path, encoding='utf-8')  # Для RU
+                documents = loader.load()
             else:
                 os.unlink(temp_file_path)
                 return []
 
-            documents = loader.load()
             os.unlink(temp_file_path)
 
             documents = [doc for doc in documents if doc.page_content.strip()]
@@ -118,12 +129,17 @@ class GoogleDriveExtractor:
         except Exception as e:
             logger.error(f"Error extracting text from {file_name}: {str(e)}")
             return []
+        finally:
+            if temp_file_path and os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
 
     def process_file(self, file_id: str) -> List[Document]:
         """Скачивает файл и извлекает текст."""
         logger.info(f"Processing file with ID: {file_id}")
         file_buffer, file_name = self.download_file(file_id)
         documents = self.extract_text(file_buffer, file_name)
+        for doc in documents:
+            doc.metadata['gdrive_id'] = file_id
         return documents
 
     def process_folder_recursive(self, folder_id: str) -> List[Document]:
@@ -145,7 +161,7 @@ class GoogleDriveExtractor:
             else:
                 # Обрабатываем файл
                 extension = os.path.splitext(item_name)[1].lower()
-                if extension not in self.supported_extensions:
+                if extension not in self.supported_extensions and mime_type != 'application/vnd.google-apps.document':
                     logger.info(f"Skipping unsupported file: {item_name}")
                     continue
                 try:

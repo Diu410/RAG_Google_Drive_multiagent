@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Контур",
+  "version": "1.0.0",
+  "identifier": "local.kontur.rag",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{"label":"main","title":"Контур","width":1280,"height":820,"minWidth":900,"minHeight":620,"center":true,"resizable":true,"maximizable":true,"minimizable":true,"closable":true,"devtools":false}],
+    "security": {"csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"}
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/32x32.png","icons/128x128.png","icons/128x128@2x.png","icons/icon.ico"],
+    "resources": {
+      "binaries/kontur-backend.exe":"kontur-backend.exe",
+      "resources/legacy-data-location.txt":"legacy-data-location.txt",
+      "resources/llama/":"llama/"
+    },
+    "windows": {"nsis":{"installMode":"currentUser","compression":"zlib"}}
+  }
+}

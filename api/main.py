@@ -1,181 +1,463 @@
+from settings import API_DIR, DATA_DIR, MAX_UPLOAD_BYTES
 # main.py - ФИНАЛЬНЫЙ КОД
 import sys
 import os
 os.environ['GRPC_VERBOSITY'] = 'ERROR'
 os.environ['GRPC_TRACE'] = 'off'
 import asyncio
-from fastapi import FastAPI, File, UploadFile, HTTPException, Body
+import threading
+import base64
+import json
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body, Response
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import uuid
 import logging
-from pydantic_models import QueryInput, QueryResponse, DocumentInfo, DeleteFileRequest, UploadGDriveRequest
-from langchain_utils import get_rag_chain
+from pathlib import Path
+from pydantic_models import (QueryInput, QueryResponse, DocumentInfo, DeleteFileRequest,
+                             UploadGDriveRequest, SearchRequest, SearchResult, ReindexRequest)
+from langchain_utils import get_rag_chain, answer_general_chat
 from db_utils import insert_application_logs, get_chat_history, get_all_documents, insert_document_record, \
-    delete_document_record
-from chroma_utils import index_document_to_chroma, delete_doc_from_chroma
+    delete_document_record, get_document_source, bump_knowledge_epoch
+from chroma_utils import index_document_to_chroma, delete_doc_from_chroma, purge_orphaned_documents
 from gdrive_extractor import GoogleDriveExtractor
 from langchain_utils import debug_chroma_search
 import shutil
 import tempfile
 from multi_agent_chain import get_multi_agent_chain
 from dotenv import load_dotenv
+from query_router import query_router
+from model_runtime import get_llm_provider
+from embedding_provider import get_embedding_provider
+from verifier import verify_answer, verify_knowledge_answer
+from workspace import FilesystemProvider, WorkspaceRepository, WorkspaceSkill
+from workspace_vector_index import WorkspaceVectorIndex
+from workspace_graph import WorkspaceGraphRepository
+from conversation_context import ConversationResolver
+from tts_provider import TTSUnavailable, tts_provider
+from llm_contract import GenerationCancelled, current_token_sink
+from document_service import DocumentService, create_document_schema
+from index_transactions import IndexTransactions
+
+
 
 # Загружаем .env
 load_dotenv()
-
-logging.basicConfig(filename='app.log', level=logging.INFO)
+logger = logging.getLogger(__name__)
 app = FastAPI()
+
+from agent_steps import router as agent_router
+app.include_router(agent_router)
+from chat_routes import router as chat_router
+app.include_router(chat_router)
+from graph_routes import router as graph_router
+app.include_router(graph_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "tauri://localhost",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type"],
 )
 
-try:
-    GDRIVE_EXTRACTOR = GoogleDriveExtractor('credentials.json')  # <-- Раскомментируй
-    logging.info("GDrive Extractor успешно инициализирован.")
-except Exception as e:
-    logging.warning(f"GDrive init failed: {e}. Установи credentials.json и авторизуйся.")
-    GDRIVE_EXTRACTOR = None
+GDRIVE_EXTRACTOR = None
+_drive_lock = asyncio.Lock()
+embedding_migration_task = None
+create_document_schema()
+document_service = DocumentService(
+    index=lambda *args: index_document_to_chroma(*args),
+    insert=lambda *args: insert_document_record(*args),
+    delete_record=lambda *args: delete_document_record(*args),
+    store_getter=lambda: __import__('chroma_utils').vectorstore,
+    delete_vectors=lambda *args: delete_doc_from_chroma(*args),
+    source_getter=lambda *args: get_document_source(*args),
+)
 
 
-@app.post("/query", response_model=QueryResponse)
-async def query_endpoint(query_input: QueryInput):
-    session_id = query_input.session_id or str(uuid.uuid4())
-    model_name = query_input.model.value
-    logging.info(f"Session ID: {session_id}, User Query: {query_input.question}, Model: {model_name}")
+def recover_indexes():
+    from chroma_utils import vectorstore, workspace_vectorstore
+    IndexTransactions().recover({'rag_collection': vectorstore, 'workspace_collection': workspace_vectorstore})
 
-    # 1. Получаем историю чата
-    chat_history = await asyncio.to_thread(get_chat_history, session_id)
 
-    # 2. Получаем RAG-цепочку
-    rag_chain = get_rag_chain(model=model_name)
-
-    # Добавь здесь:
-    multi_agent_func = get_multi_agent_chain()
-    logging.info(f"DEBUG multi: func = {multi_agent_func is not None}, use_multi = {query_input.use_multi_agent}")
-
-    if query_input.use_multi_agent and multi_agent_func:
-        logging.info("DEBUG: Running multi-agent...")
-        try:
-            response = await asyncio.to_thread(multi_agent_func, query_input.question, chat_history)
-            intermediate = f"Draft: {response['draft'][:200]}...\nEdited: {response['edited'][:200]}...\nEnhanced: {len(response['enhanced'])} variants"
-            logging.info(f"DEBUG multi response keys: {response.keys()}")
-            answer = response["final"]
-            context_text = response["context"]
-            logging.info(f"DEBUG multi: Final len = {len(answer)} chars")
-            # Return сразу — без single RAG
-            await asyncio.to_thread(insert_application_logs, session_id, query_input.question, answer, model_name)
-            return QueryResponse(
-                answer=answer,
-                session_id=session_id,
-                model=query_input.model,
-                context=context_text
-            )
-        except Exception as e:
-            logging.error(f"Multi-agent error: {e} — fallback to single RAG")
-            # Только fallback, если краш
-            rag_response = rag_chain.invoke({"input": query_input.question, "chat_history": chat_history})
-            answer = rag_response["answer"]
-            context_text = "\n\n".join([doc.page_content for doc in rag_response.get("context", [])])
-    else:
-        logging.info("DEBUG: Running single RAG")
-        response = rag_chain.invoke({"input": query_input.question, "chat_history": chat_history})
-        answer = response["answer"]
-        context_text = "\n\n".join([doc.page_content for doc in response.get("context", [])])
-
-    # Общий return (только для single или fallback)
-    await asyncio.to_thread(insert_application_logs, session_id, query_input.question, answer, model_name)
-    return QueryResponse(
-        answer=answer,
-        session_id=session_id,
-        model=query_input.model,
-        context=context_text
-    )
-
-    # 3. ПРОВЕРКА: Если LLM не инициализировался (решает ошибку 'NoneType')
-    if rag_chain is None:
-        logging.error(f"Query error in session {session_id}: RAG Chain failed to initialize (LLM/DB issue)")
-        raise HTTPException(
-            status_code=503,
-            detail="LLM or Database components failed to initialize. Check GEMINI_API_KEY."
-        )
-    logging.info(f"Query: {query_input.question}. История: {len(chat_history)} сообщений.")
+async def migrate_embedding_spaces():
     try:
-        # 4. Выполняем запрос
-        response = rag_chain.invoke({
-            "input": query_input.question,
-            "chat_history": chat_history,
-        })
+        embeddings = get_embedding_provider()
+        if embeddings.manager:
+            await asyncio.to_thread(embeddings.manager.ensure_ready)
+        from chroma_utils import rebuild_embedding_indexes
+        await asyncio.to_thread(rebuild_embedding_indexes)
+    except Exception:
+        logger.exception('Embedding index migration unavailable; legacy index preserved for retry')
 
-        # Дебаг: Фикс для list
-        context_docs = response.get("context", [])
-        context_str = "\n\n---\n\n".join([doc.page_content for doc in context_docs])
-        logging.info(
-            f"Контекст вернул {len(context_docs)} чанков (str len: {len(context_str)} символов) для query '{query_input.question}'.")
+@app.on_event("startup")
+async def start_model_services():
+    global embedding_migration_task
+    try:
+        await asyncio.to_thread(recover_indexes)
+        await asyncio.to_thread(assistant_repository.recover_interrupted_tasks)
+        documents = await asyncio.to_thread(get_all_documents)
+        await asyncio.to_thread(purge_orphaned_documents, [item["id"] for item in documents])
+    except Exception:
+        logging.exception("Could not reconcile Chroma with the document database")
+    get_llm_provider().manager.start_background()
+    embeddings = get_embedding_provider()
+    if embeddings.manager:
+        embeddings.manager.start_background()
+    embedding_migration_task = asyncio.create_task(migrate_embedding_spaces())
 
-        # 5. Извлекаем ответ и контекст
-        answer = response["answer"]
-        context_text = "\n\n".join([doc.page_content for doc in context_docs])  # Уже есть, ок
 
-        # 6. Сохраняем историю и логи
-        await asyncio.to_thread(insert_application_logs, session_id, query_input.question, answer, model_name)
+@app.on_event("shutdown")
+async def stop_model_services():
+    if embedding_migration_task:
+        embedding_migration_task.cancel()
+        await asyncio.gather(embedding_migration_task, return_exceptions=True)
+    provider = get_llm_provider()
+    await asyncio.to_thread(provider.close)
+    await asyncio.to_thread(provider.manager.stop)
+    embeddings = get_embedding_provider()
+    if embeddings.manager:
+        await asyncio.to_thread(embeddings.manager.stop)
 
-        return QueryResponse(
-            answer=answer,
-            session_id=session_id,
-            model=query_input.model,
-            context=context_text
+
+@app.get("/api/model-status")
+async def model_status():
+    from model_profiles import PROFILES, get_profile
+    status = await asyncio.to_thread(get_llm_provider().health)
+    return {**status, 'profiles': list(PROFILES), 'default_profile': get_profile().name,
+            'message': 'Модель готова' if status['ready'] else status.get('error') or 'Запуск модели...'}
+
+
+@app.post("/assistant/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    return {'cancelled': assistant_core.cancel_task(task_id)}
+
+
+@app.get("/assistant/tasks")
+async def active_tasks():
+    return await asyncio.to_thread(lambda: [assistant_core.repository.get_task(task_id)
+                                           for task_id in list(assistant_core.active_tasks)])
+
+
+@app.get("/assistant/tasks/{task_id}")
+async def task_status(task_id: str):
+    try:
+        return {'task': await asyncio.to_thread(assistant_core.repository.get_task, task_id),
+                'actions': await asyncio.to_thread(assistant_core.repository.actions, task_id)}
+    except LookupError:
+        raise HTTPException(404, 'Task not found')
+
+
+@app.get("/api/health", tags=["system"])
+async def health() -> dict[str, str]:
+    """Cheap process-readiness probe used by the desktop shell."""
+    return {"status": "ok"}
+
+
+@app.post('/rebuild-search-index')
+async def rebuild_search_index():
+    from chroma_utils import rebuild_embedding_indexes
+    try:
+        return await asyncio.to_thread(rebuild_embedding_indexes)
+    except Exception as exc:
+        logging.exception('Embedding index migration failed; previous collections retained')
+        raise HTTPException(503, 'Не удалось обновить поисковый индекс. Проверьте embedding-модель и журнал backend.') from exc
+
+
+@app.get("/voice/status")
+async def voice_status():
+    return tts_provider.status()
+
+
+@app.post("/voice/synthesize")
+async def synthesize_voice(payload: dict = Body(...)):
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(422, "text is required")
+    if len(text) > 12000:
+        raise HTTPException(413, "Text is too long for one voice turn")
+    try:
+        audio = await asyncio.to_thread(tts_provider.synthesize, text)
+        return Response(content=audio, media_type="audio/wav",
+                        headers={"Cache-Control": "no-store"})
+    except TTSUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.post("/voice/stream")
+async def stream_voice(payload: dict = Body(...)):
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(422, "text is required")
+
+    def chunks():
+        try:
+            announced = False
+            for sample_rate, tensor in tts_provider.stream_pcm(text[:4000]):
+                if not announced:
+                    yield json.dumps({"type": "format", "sample_rate": sample_rate}) + "\n"
+                    announced = True
+                samples = tensor.detach().cpu().float().reshape(-1).clamp(-1, 1)
+                pcm = (samples.numpy() * 32767).astype("<i2").tobytes()
+                yield json.dumps({"type": "audio", "pcm": base64.b64encode(pcm).decode("ascii")}) + "\n"
+            yield json.dumps({"type": "done"}) + "\n"
+        except TTSUnavailable as exc:
+            yield json.dumps({"type": "error", "message": str(exc)}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(chunks(), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+workspace_repository = WorkspaceRepository()
+filesystem_provider = FilesystemProvider(workspace_repository)
+workspace_vector_index = WorkspaceVectorIndex(
+    filesystem_provider, graph_repository=WorkspaceGraphRepository()
+)
+
+
+@app.get("/workspaces/active")
+async def active_workspace():
+    workspace = await asyncio.to_thread(workspace_repository.active)
+    return {"workspace": workspace}
+
+
+@app.post("/workspaces/select")
+async def select_workspace(payload: dict = Body(...)):
+    root_path = payload.get("root_path")
+    if not isinstance(root_path, str) or not root_path.strip():
+        raise HTTPException(422, "root_path is required")
+    try:
+        workspace = await asyncio.to_thread(workspace_repository.select, root_path)
+        await asyncio.to_thread(filesystem_provider.sync_index, workspace.id)
+        return await asyncio.to_thread(filesystem_provider.list_directory, workspace.id, "")
+    except (ValueError, FileNotFoundError, PermissionError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/workspaces/{workspace_id}/files")
+async def list_workspace_files(workspace_id: str, path: str = ""):
+    try:
+        return await asyncio.to_thread(filesystem_provider.list_directory, workspace_id, path)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ValueError, FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/workspaces/{workspace_id}/file")
+async def read_workspace_file(workspace_id: str, path: str):
+    try:
+        workspace, relative_path, content = await asyncio.to_thread(
+            filesystem_provider.read_text_file, workspace_id, path
         )
+        return {"workspace_id": workspace.id, "path": relative_path, "content": content}
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ValueError, FileNotFoundError, PermissionError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
-    except Exception as e:
-        logging.error(f"Query processing error in session {session_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Query processing error: {str(e)}")
+
+@app.post("/workspaces/{workspace_id}/sync")
+async def sync_workspace(workspace_id: str):
+    try:
+        return await asyncio.to_thread(filesystem_provider.sync_index, workspace_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ValueError, FileNotFoundError, PermissionError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/workspaces/{workspace_id}/index")
+async def workspace_index(workspace_id: str, path: str = ""):
+    try:
+        await asyncio.to_thread(filesystem_provider.sync_index, workspace_id)
+        return await asyncio.to_thread(workspace_repository.indexed_files, workspace_id, path)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ValueError, FileNotFoundError, PermissionError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/workspaces/{workspace_id}/vector-sync")
+async def sync_workspace_vectors(workspace_id: str):
+    try:
+        result = await asyncio.to_thread(workspace_vector_index.sync, workspace_id)
+        return result.__dict__
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ValueError, FileNotFoundError, PermissionError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/assistant/input", response_model=QueryResponse)
+@app.post("/query", response_model=QueryResponse)
+async def query_endpoint(query_input: QueryInput, response: Response):
+    result, elapsed_ms = await assistant_core.process_input(query_input)
+    response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
+    return result
+
+
+@app.post("/assistant/live")
+async def live_query_endpoint(query_input: QueryInput):
+    """Stream conversational model tokens and expose cancellation early."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    task_id: str | None = None
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    streamed: list[str] = []
+
+    async def publish(item):
+        await queue.put(item)
+
+    def answer_chunks(value: str, size: int = 48):
+        """Keep transport incremental without exposing intermediate model generations."""
+        start = 0
+        while start < len(value):
+            end = min(start + size, len(value))
+            if end < len(value):
+                boundary = max(value.rfind(" ", start, end), value.rfind("\n", start, end))
+                if boundary > start:
+                    end = boundary + 1
+            yield value[start:end]
+            start = end
+
+    def publish_token(value: str):
+        if not value:
+            return
+        streamed.append(value)
+        item = {"type": "token", "text": value}
+        if threading.get_ident() == loop_thread:
+            queue.put_nowait(item)
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(queue.put(item), loop).result(timeout=30)
+        except Exception:
+            logger.debug("Live token consumer is no longer available")
+
+    async def run():
+        nonlocal task_id
+        token = current_token_sink.set(publish_token)
+        try:
+            await publish({"type": "stage", "stage": "thinking"})
+            def started(task):
+                nonlocal task_id
+                task_id = task.id
+                queue.put_nowait({"type": "task", "task_id": task.id})
+            response, _ = await assistant_core.process_input(
+                query_input.model_copy(update={"live_mode": True}),
+                source="voice", on_task_started=started,
+            )
+            if not streamed:
+                await publish({"type": "stage", "stage": "answering"})
+                for value in answer_chunks(response.answer):
+                    await publish({"type": "token", "text": value})
+            elif "".join(streamed) != response.answer:
+                # Tool-only and fallback paths may not stream their final text.
+                await publish({"type": "reset"})
+                for value in answer_chunks(response.answer):
+                    await publish({"type": "token", "text": value})
+            await publish({"type": "result", "response": response.model_dump(mode="json")})
+        except (asyncio.CancelledError, GenerationCancelled):
+            if task_id:
+                assistant_core.cancel_task(task_id)
+            raise
+        except Exception as exc:
+            logger.exception("Live assistant turn failed")
+            await publish({"type": "error", "message": str(exc)})
+        finally:
+            current_token_sink.reset(token)
+            # Completion is part of the protocol, including when the consumer
+            # is slow. Disconnect cancels this producer and its pending put.
+            await queue.put(None)
+
+    async def events():
+        task = asyncio.create_task(run())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield json.dumps(item, ensure_ascii=False) + "\n"
+        finally:
+            if not task.done():
+                if task_id:
+                    assistant_core.cancel_task(task_id)
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    return StreamingResponse(events(), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+async def read_limited(file):
+    size = 0
+    while chunk := await file.read(1024 * 1024):
+        size += len(chunk)
+        if size > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "Upload exceeds size limit")
+        yield chunk
+
 
 @app.post("/upload-doc")
 async def upload_document(file: UploadFile = File(...)):
-    logging.info(f"DEBUG backend: /upload-doc called with filename = {file.filename}, size = {file.size}")
-    if file.filename.endswith(('.pdf', '.docx', '.html', '.txt')):
-        temp_dir = tempfile.mkdtemp()
-        file_path = os.path.join(temp_dir, file.filename)
+    file_id = None
+    try:
+        filename = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in {".pdf", ".docx", ".html", ".txt"}:
+            raise HTTPException(400, "Unsupported file type")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "upload" + ext)
+            with open(path, "wb") as target:
+                async for chunk in read_limited(file):
+                    await asyncio.to_thread(target.write, chunk)
+            source_bytes = await asyncio.to_thread(Path(path).read_bytes)
+            try:
+                file_id = await asyncio.to_thread(document_service.upload, filename, source_bytes, 'raw', path)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+        return {"message": "File uploaded and indexed successfully", "file_id": file_id}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.exception("Upload failed for document %s", file_id)
+        raise HTTPException(500, "Indexing failed. Check backend logs.")
+    finally:
+        await file.close()
 
-        try:
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
 
-            file_id = await asyncio.to_thread(insert_document_record, file.filename)
+# Optional browser preview for developers only. Desktop production loads the
+# bundled React assets directly from Tauri and exposes FastAPI as API-only.
+if os.getenv("KONTUR_DESKTOP") != "1":
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse
+    _frontend = API_DIR.parent / 'frontend' / 'dist'
+    if (_frontend / 'assets').is_dir():
+        app.mount('/assets', StaticFiles(directory=str(_frontend / 'assets')), name='frontend-assets')
 
-            success = await asyncio.to_thread(index_document_to_chroma, file_path, file_id)
-
-            if success:
-                logging.info(f"File '{file.filename}' uploaded and indexed successfully with ID {file_id}.")
-                return {"message": "File uploaded and indexed successfully", "file_id": file_id}
-            else:
-                await asyncio.to_thread(delete_document_record, file_id)
-                logging.error(f"Failed to index file {file.filename} into Chroma. Deleting DB record.")
-                raise HTTPException(status_code=500, detail="Failed to index document (Embedding/Chroma issue).")
-
-        except Exception as e:
-            logging.error(f"Upload error: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
-        finally:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported file type.")
+    @app.get('/', include_in_schema=False)
+    def frontend_index():
+        if not (_frontend / 'index.html').is_file():
+            raise HTTPException(503, 'Build frontend with npm run build in frontend/')
+        return FileResponse(_frontend / 'index.html')
 
 
 @app.post("/upload-gdrive")
 async def upload_gdrive_folder(request: UploadGDriveRequest):
-    if GDRIVE_EXTRACTOR is None:
-        raise HTTPException(status_code=501, detail="Google Drive functionality is disabled because 'credentials.json' is missing or GDrive Extractor failed to initialize.")
-
-    logging.info(f"Starting GDrive upload for URL: {request.folder_url}")
+    global GDRIVE_EXTRACTOR
     try:
-        documents = await asyncio.to_thread(GDRIVE_EXTRACTOR.process_folder, request.folder_url)
+        async with _drive_lock:
+            if GDRIVE_EXTRACTOR is None:
+                token = str(DATA_DIR / "token.json")
+                if not os.path.exists(token):
+                    raise HTTPException(503, "Run api/gdrive_auth.py to authorize Google Drive first")
+                GDRIVE_EXTRACTOR = await asyncio.to_thread(GoogleDriveExtractor, str(DATA_DIR / "credentials.json"), token)
+            documents = await asyncio.to_thread(GDRIVE_EXTRACTOR.process_folder, request.folder_url)
 
         if not documents:
             raise ValueError("No valid documents extracted from folder")
@@ -185,27 +467,34 @@ async def upload_gdrive_folder(request: UploadGDriveRequest):
         grouped_docs = defaultdict(list)
         for doc in documents:
             filename = doc.metadata.get("source", "GDrive File")
-            grouped_docs[filename].append(doc)
+            grouped_docs[doc.metadata.get("gdrive_id", filename)].append(doc)
 
         indexed_count = 0
-        for filename, docs_group in grouped_docs.items():
+        for _, docs_group in grouped_docs.items():
+            filename = docs_group[0].metadata.get("source", "GDrive File")
             # Один file_id на уникальный filename
-            file_id = await asyncio.to_thread(insert_document_record, filename)
-
-            # Индексируем все docs из группы (если loader вернул несколько на файл)
-            success = await asyncio.to_thread(index_document_to_chroma, docs_group, file_id)
-
-            if success:
+            serialized = json.dumps([
+                {"page_content": doc.page_content, "metadata": doc.metadata} for doc in docs_group
+            ], ensure_ascii=False, default=str).encode("utf-8")
+            try:
+                remote_id = docs_group[0].metadata.get('gdrive_id')
+                file_id = await asyncio.to_thread(document_service.upload, filename, serialized,
+                    'documents_json', docs_group, 'gdrive:' + str(remote_id) if remote_id else None)
                 indexed_count += 1
                 logging.info(f"Indexed {filename} with {len(docs_group)} docs, file_id {file_id}")
-            else:
-                await asyncio.to_thread(delete_document_record, file_id)
-                logging.warning(f"Failed to index {filename}, deleted record {file_id}")
+            except ValueError:
+                logging.warning('Failed to index Drive document %s; previous revision preserved', filename)
 
+        if indexed_count == 0:
+            raise HTTPException(422, "No documents could be indexed")
         logging.info(f"Successfully indexed {indexed_count} unique files out of {len(grouped_docs)} from Google Drive.")
         return {"message": f"Successfully processed and indexed {indexed_count} unique documents from Google Drive.",
                 "total_unique_files": len(grouped_docs), "indexed_files": indexed_count}
 
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logging.error(f"GDrive upload error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"GDrive processing error: {str(e)}")
@@ -216,30 +505,133 @@ async def list_documents():
     try:
         documents = await asyncio.to_thread(get_all_documents)
         return documents
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"List documents error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _document_result(document):
+    metadata = dict(document.metadata)
+    found_by = metadata.pop("found_by", "semantic")
+    score = metadata.pop("score", 0.0)
+    return {
+        "document_id": metadata.get("document_id", metadata.get("file_id")),
+        "chunk_id": metadata.get("chunk_id", ""),
+        "text": document.page_content,
+        "metadata": metadata,
+        "score": score,
+        "found_by": [value for value in found_by.split(",") if value],
+    }
+
+
+@app.post("/search", response_model=list[SearchResult])
+async def search_documents(request: SearchRequest):
+    """Search document chunks without running the answer-generating LLM."""
+    from chroma_utils import retriever, vectorstore
+    from hybrid_context_extractor import HybridRetriever
+    if vectorstore is None or (request.mode.value != "lexical" and retriever is None):
+        raise HTTPException(503, "Search unavailable. Check Chroma and the embedding provider.")
+    searcher = HybridRetriever(
+        retriever, vectorstore, request.mode.value, False, request.limit,
+        lexical_weight=1.25 if request.mode.value == "hybrid" else 1.0,
+    )
+    try:
+        return [item.as_dict() for item in await asyncio.to_thread(searcher.search, request.query)]
+    except Exception:
+        logging.exception("Document search failed")
+        raise HTTPException(502, "Document search failed. Check backend logs.")
+
+
 @app.post("/delete-doc")
 async def delete_document(request: DeleteFileRequest):
     try:
-        chroma_delete_success = await asyncio.to_thread(delete_doc_from_chroma, request.file_id)
+        await asyncio.to_thread(document_service.delete, request.file_id)
+        return {"message": f"Deleted document {request.file_id}."}
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        logging.exception("Document deletion failed; recovery journal preserves the source")
+        raise HTTPException(500, "Document deletion failed. Check backend logs.") from exc
 
-        if chroma_delete_success:
-            db_delete_success = await asyncio.to_thread(delete_document_record, request.file_id)
-            if db_delete_success:
-                logging.info(f"Successfully deleted document with file_id {request.file_id} from the system.")
-                return {"message": f"Successfully deleted document with file_id {request.file_id} from the system."}
-            else:
-                logging.error(
-                    f"Deleted from Chroma but failed to delete document with file_id {request.file_id} from the database.")
-                raise HTTPException(status_code=500,
-                                    detail="Document deleted from Chroma, but failed to remove DB record.")
-        else:
-            logging.error(f"Failed to delete document with file_id {request.file_id} from Chroma.")
-            raise HTTPException(status_code=500,
-                                detail=f"Failed to delete document with file_id {request.file_id} from Chroma.")
+
+def _reindex_document(file_id: int) -> None:
+    document_service.reindex(file_id)
+
+
+@app.post("/reindex-docs")
+async def reindex_documents(request: ReindexRequest):
+    completed, failed = [], []
+    for file_id in request.file_ids:
+        try:
+            await asyncio.to_thread(_reindex_document, file_id)
+            completed.append(file_id)
+        except (LookupError, ValueError) as exc:
+            failed.append({"file_id": file_id, "error": str(exc)})
+        except Exception as exc:
+            logging.exception("Reindex failed for document %s", file_id)
+            failed.append({"file_id": file_id, "error": str(exc)})
+    status = "completed" if not failed else "partial" if completed else "failed"
+    return {"status": status, "reindexed": completed, "failed": failed}
+
+@app.post("/transcribe")
+async def transcribe_audio_endpoint(file: UploadFile = File(...)):
+    """Принимает аудиофайл, возвращает распознанный текст через Whisper."""
+    try:
+        from whisper_utils import transcribe_audio
+        audio_bytes = bytearray()
+        async for chunk in read_limited(file):
+            audio_bytes.extend(chunk)
+        if not audio_bytes:
+            raise HTTPException(422, "Audio is empty")
+        text = await asyncio.to_thread(transcribe_audio, bytes(audio_bytes), file.filename or "audio.wav")
+        if not text:
+            raise HTTPException(status_code=422, detail="Не удалось распознать речь")
+        return {"text": text}
+    except RuntimeError as e:
+        raise HTTPException(status_code=501, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
-        logging.error(f"Delete error: {str(e)}")
+        logging.error(f"Transcribe error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await file.close()
+
+
+# Only dependency wiring lives in the HTTP application. Core has no FastAPI dependency.
+from assistant_core import AssistantCore
+from assistant_models import AssistantError
+from assistant_repository import AssistantRepository
+from agent_planner import LLMAgentPlanner
+from knowledge_skill import KnowledgeSkill, KnowledgeServices
+from fastapi.responses import JSONResponse
+
+assistant_repository = AssistantRepository()
+# Assistant sessions may be created by the additive Core migration above.
+# Re-run the idempotent workspace migration to add their workspace link on
+# databases that did not have Assistant Core yet when this module was imported.
+workspace_repository.migrate()
+assistant_core = AssistantCore(
+    assistant_repository,
+    KnowledgeSkill(KnowledgeServices(
+        route=lambda *a, **kw: query_router.route(*a, **kw),
+        history=lambda *a, **kw: get_chat_history(*a, **kw),
+        general_chat=lambda *a, **kw: answer_general_chat(*a, **kw),
+        multi_chain=lambda: get_multi_agent_chain(),
+        rag_chain=lambda **kw: get_rag_chain(**kw),
+        document_result=lambda doc: _document_result(doc),
+        verify=lambda *a, **kw: verify_knowledge_answer(*a, **kw),
+    )),
+    save_history=lambda *a: insert_application_logs(*a),
+    workspace_skill=WorkspaceSkill(filesystem_provider, vector_indexer=workspace_vector_index),
+    history_loader=lambda session_id: get_chat_history(session_id),
+    conversation_resolver=ConversationResolver(),
+    agent_planner=LLMAgentPlanner(),
+)
+
+
+@app.exception_handler(AssistantError)
+async def assistant_error_handler(request, exc):
+    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})

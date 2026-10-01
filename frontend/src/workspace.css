@@ -1,0 +1,34 @@
+.workspace-link {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0;
+  text-align: left; margin: 8px 0 0; padding: 10px; border-color: #d9e4d4; color: #687b68;
+}
+.workspace-link.active { background: #e8efe3; color: #355b40; }
+.workspace-link > span { display: flex; flex-direction: column; min-width: 0; }
+.workspace-link b { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.workspace-link small {
+  font-size: 9px; opacity: .68; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; max-width: 195px; margin-top: 3px;
+}
+.workspace-toolbar { display: flex; align-items: center; gap: 8px; margin: 20px 0 12px; }
+.workspace-toolbar button { display: flex; align-items: center; gap: 7px; }
+.workspace-toolbar span {
+  margin-left: auto; min-width: 0; color: #83917c; font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.workspace-files { border: 1px solid #e0e7db; border-radius: 12px; overflow: auto; max-height: 52vh; }
+.workspace-entry {
+  display: flex; align-items: center; gap: 10px; width: 100%; border: 0;
+  border-bottom: 1px solid #edf1e9; border-radius: 0; text-align: left; padding: 11px 13px;
+}
+.workspace-entry:last-child { border-bottom: 0; }
+.workspace-entry.directory { color: #3f6749; }
+.workspace-entry.file { color: #68776a; }
+.workspace-entry:disabled { opacity: .65; }
+.workspace-entry span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-entry small { font-size: 9px; color: #929d8e; }
+.workspace-preview {
+  max-height: 52vh; overflow: auto; margin: 0; padding: 16px;
+  border: 1px solid #e0e7db; border-radius: 12px; background: #f7f9f4;
+  color: #34453a; font: 12px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
