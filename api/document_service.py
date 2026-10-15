@@ -27,17 +27,41 @@ class DocumentService:
                     file_id = row['id'] if row else None
             created = file_id is None
             file_id = file_id or self.insert(filename, source, kind)
-            success = self.index(input_data, file_id)
-            if not success:
-                if created:
-                    self.delete_record(file_id)
-                raise ValueError('Document is empty or could not be indexed')
-            with closing(self.connection_factory()) as conn, conn:
+            source_committed = False
+
+            def commit_source(conn):
+                nonlocal source_committed
+                previous = conn.execute(
+                    'SELECT filename,source_content,source_kind FROM document_store WHERE id=?',
+                    (file_id,),
+                ).fetchone()
+                if previous is None:
+                    raise LookupError('Document disappeared during indexing')
+                changed = not created and (previous['filename'] != filename or
+                    previous['source_content'] != source or previous['source_kind'] != kind)
                 conn.execute('UPDATE document_store SET filename=?,source_content=?,source_kind=? WHERE id=?',
                              (filename, source, kind, file_id))
                 if source_id:
                     conn.execute('INSERT INTO document_sources(source_id,id) VALUES(?,?) '
                                  'ON CONFLICT(source_id) DO UPDATE SET id=excluded.id', (source_id, file_id))
+                if changed:
+                    # Answers based on the previous source must not remain
+                    # hidden model context after a successful replacement.
+                    conn.execute("INSERT INTO application_state(key,value) VALUES('knowledge_epoch','1') "
+                                 "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1")
+                source_committed = True
+
+            success = self.index(input_data, file_id, commit=commit_source, source_name=filename)
+            if not success:
+                if created:
+                    self.delete_record(file_id)
+                raise ValueError('Document is empty or could not be indexed')
+            # Compatibility for injected index adapters that report success
+            # without using the transactional callback. The production writer
+            # commits source metadata with its index journal in one transaction.
+            if not source_committed:
+                with closing(self.connection_factory()) as conn, conn:
+                    commit_source(conn)
             return file_id
 
     def reindex(self, file_id):

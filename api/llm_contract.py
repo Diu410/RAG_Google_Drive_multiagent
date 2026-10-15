@@ -4,11 +4,20 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from threading import Event
+import time
 from typing import Iterator, Protocol
 
 
 class ProviderError(RuntimeError):
     pass
+
+
+class StructuredOutputTruncated(ProviderError):
+    """The server exhausted its output budget before completing the assessment."""
+
+
+class GenerationDeadlineExceeded(ProviderError):
+    """Elapsed wall time, including a stream that keeps receiving tokens."""
 
 
 class GenerationCancelled(asyncio.CancelledError):
@@ -19,6 +28,14 @@ class GenerationCancelled(asyncio.CancelledError):
 class GenerationScope:
     task_id: str
     cancelled: Event = field(default_factory=Event)
+    deadline: float | None = None
+
+    def remaining_seconds(self):
+        return None if self.deadline is None else max(0, self.deadline - time.perf_counter())
+
+    def check_deadline(self):
+        if self.deadline is not None and time.perf_counter() >= self.deadline:
+            raise GenerationDeadlineExceeded('Достигнут лимит времени ответа. Непроверенные сведения не подтверждены.')
 
 
 current_scope = ContextVar('generation_scope', default=None)
@@ -40,12 +57,15 @@ def generation_scope(task_id):
 
 @dataclass
 class GenerationMetrics:
+    preparation_ms: float = 0
+    request_total_ms: float = 0
     llm_request_ms: float = 0
     time_to_first_token_ms: float | None = None
     generation_total_ms: float = 0
     tokens_per_second: float | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    finish_reason: str | None = None
 
 
 @dataclass
@@ -71,3 +91,16 @@ class LLMProvider(Protocol):
     def health(self) -> dict: ...
     def cancel(self, generation_id: str) -> bool: ...
     def get_model_info(self) -> dict: ...
+
+
+def completed_generation_text(text, finish_reason):
+    """Keep complete sentences when a text generation reaches its token limit.
+
+    This is presentation handling, not evidence verification. Callers must
+    retain the original draft and expose the incomplete generation separately.
+    """
+    if finish_reason != 'length':
+        return text, False
+    import re
+    boundaries = list(re.finditer(r'[.!?](?:[»”"\']*)(?=\s|$)', text))
+    return (text[:boundaries[-1].end()].rstrip() if boundaries else ''), True

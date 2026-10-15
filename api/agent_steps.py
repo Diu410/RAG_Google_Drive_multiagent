@@ -23,27 +23,34 @@ class TextRequest(BaseModel):
 class DraftRequest(TextRequest):
     model: ModelName = ModelName(DEFAULT_CHAT_MODEL)
     input: str
-    context: str = ""
-    chat_history: List = Field(default_factory=list)
+    context: str = Field(default='', max_length=200000)
+    chat_history: List = Field(default_factory=list, max_length=12)
+    workspace_id: str | None = Field(default=None, max_length=128)
 
 
 class EditRequest(TextRequest):
     model: ModelName = ModelName(DEFAULT_CHAT_MODEL)
     draft: str
-    comment: str = ""
+    comment: str = Field(default='', max_length=8000)
+    question: str = Field(default='', max_length=32000)
+    context: str = Field(default='', max_length=200000)
 
 
 class EnhanceRequest(TextRequest):
     model: ModelName = ModelName(DEFAULT_CHAT_MODEL)
     edited: str
-    comment: str = ""
+    comment: str = Field(default='', max_length=8000)
+    question: str = Field(default='', max_length=32000)
+    context: str = Field(default='', max_length=200000)
 
 
 class MergeRequest(TextRequest):
     model: ModelName = ModelName(DEFAULT_CHAT_MODEL)
     edited: str
-    enhanced: List[str]
-    comment: str = ""
+    enhanced: List[str] = Field(max_length=4)
+    comment: str = Field(default='', max_length=8000)
+    question: str = Field(default='', max_length=32000)
+    context: str = Field(default='', max_length=200000)
 
 
 class AgentStepResponse(BaseModel):
@@ -51,7 +58,7 @@ class AgentStepResponse(BaseModel):
     variants: List[str] = Field(default_factory=list)  # Для enhance — список вариантов
     strategy: str | None = None
     context: str = ""
-    results: List[SearchResult] = Field(default_factory=list)
+    results: List[SearchResult] = Field(default_factory=list, max_length=100)
     verification: VerificationResult | None = None
 
 
@@ -60,12 +67,20 @@ class VerifyStepRequest(TextRequest):
     question: str
     answer: str
     strategy: str
-    results: List[SearchResult] = Field(default_factory=list)
+    results: List[SearchResult] = Field(default_factory=list, max_length=100)
 
 
 @router.post("/draft", response_model=AgentStepResponse)
 async def run_draft(req: DraftRequest):
     import asyncio
+    if req.workspace_id:
+        # Compatibility API only: the application now runs editing internally.
+        from main import assistant_core
+        from pydantic_models import QueryInput
+        response, _ = await assistant_core.process_input(QueryInput(
+            question=req.input, workspace_id=req.workspace_id, model=req.model, use_multi_agent=True))
+        return AgentStepResponse(result=response.answer, strategy=response.strategy,
+            context=response.context, results=response.results, verification=response.verification)
     route = await asyncio.to_thread(query_router.route, req.input, req.model.value)
     if route.strategy == QueryStrategy.GENERAL_CHAT and not req.context:
         answer = await asyncio.to_thread(answer_general_chat, req.input, req.chat_history, req.model.value)
@@ -92,7 +107,7 @@ async def run_edit(req: EditRequest):
     # Передаём комментарий пользователя агенту
     state = {
         "model": req.model.value,
-        "input": "", "chat_history": [], "context": "",
+        "input": req.question, "chat_history": [], "context": req.context,
         "draft": req.draft,
         "user_comment": req.comment,  # агент учтёт это
         "edited": "", "enhanced": [], "final": ""
@@ -106,7 +121,7 @@ async def run_enhance(req: EnhanceRequest):
     import asyncio
     state = {
         "model": req.model.value,
-        "input": "", "chat_history": [], "context": "", "draft": "",
+        "input": req.question, "chat_history": [], "context": req.context, "draft": "",
         "edited": req.edited,
         "user_comment": req.comment,
         "enhanced": [], "final": ""
@@ -120,7 +135,7 @@ async def run_merge(req: MergeRequest):
     import asyncio
     state = {
         "model": req.model.value,
-        "input": "", "chat_history": [], "context": "", "draft": "",
+        "input": req.question, "chat_history": [], "context": req.context, "draft": "",
         "edited": req.edited,
         "enhanced": req.enhanced,
         "user_comment": req.comment,

@@ -1,7 +1,7 @@
 [package]
 name = "kontur-desktop"
 version = "1.0.0"
-description = "Kontur local RAG desktop shell"
+description = "Fortuna local personal assistant"
 edition = "2021"
 
 [lib]
@@ -18,6 +18,7 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-window-state = "2"
 tauri-plugin-dialog = "2"
 ureq = { version = "2", default-features = false }
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

@@ -9,6 +9,7 @@ from hybrid_context_extractor import HybridRetriever
 import os
 import logging
 from model_runtime import create_chat_model, InferenceMode
+from model_profiles import get_profile
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +216,6 @@ def create_multi_agent_graph():
 def run_multi_agent(input_query: str, chat_history: List[BaseMessage], model=None,
                     search_mode="semantic", result_k=3, lexical_weight=1.0,
                     query_variants=None):
-    graph = create_multi_agent_graph()
     initial_state = {
         "input": input_query,
         "model": model,
@@ -232,7 +232,19 @@ def run_multi_agent(input_query: str, chat_history: List[BaseMessage], model=Non
         "final": "",
         "user_comment": "",
     }
-    result = graph.invoke(initial_state)
+    # The automatic workflow is linear; rebuilding a graph adds no scheduling
+    # benefit. FAST keeps one edit and skips alternatives and their merge.
+    result = initial_state
+    result.update(draft_agent(result))
+    if not result.get('results'):
+        result['final'] = result['draft']
+    else:
+        result.update(edit_agent(result))
+        if get_profile(model).name == 'FAST':
+            result['final'] = result['edited']
+        else:
+            result.update(enhance_agent(result))
+            result.update(merge_agent(result))
     return {
         "final": result["final"],
         "draft": result["draft"],

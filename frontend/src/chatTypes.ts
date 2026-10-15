@@ -1,3 +1,5 @@
+import type {GraphSelection} from './graphTypes';
+
 export type SearchResult = {
   document_id: number | string | null;
   chunk_id: string;
@@ -10,6 +12,9 @@ export type Verification = {
   status: string;
   confidence?: number | null;
   warning?: string | null;
+  checked_answer?: string | null;
+  answer_scope?: string | null;
+  review_mode?: string | null;
   source_chunk_ids: string[];
   unsupported_claims: string[];
   conflicting_claims: string[];
@@ -19,6 +24,8 @@ export type Verification = {
     source_chunk_ids: string[];
     basis?: string | null;
     evidence_quote?: string | null;
+    note?: string | null;
+    original_text?: string | null;
   }[];
   components?: {
     retrieval: number;
@@ -27,6 +34,8 @@ export type Verification = {
   } | null;
 };
 export type GraphInfo = {
+  scope?: {workspace_id: string | null; label: string};
+  retrieval?: {selected_source_count: number; graph_added_source_count: number};
   entities: { id: number; display_name: string; entity_type: string }[];
   relations: {
     id: number;
@@ -35,14 +44,17 @@ export type GraphInfo = {
     relation_type: string;
     target_name: string;
     target_type: string;
-    document_id: number;
+    document_id: number | string;
     document_name?: string | null;
     chunk_id: string;
     evidence?: string;
   }[];
-  documents: { id: number; name?: string | null }[];
+  documents: { id: number | string; name?: string | null }[];
 };
 export type Message = {
+  id?: string;
+  reply_to?: string | null;
+  task_id?: string;
   role: "user" | "assistant";
   content: string;
   timestamp: string;
@@ -50,6 +62,7 @@ export type Message = {
   strategy?: string;
   verification?: Verification | null;
   graph?: GraphInfo | null;
+  graphSelection?: GraphSelection;
   steps?: { draft?: string; edited?: string; enhanced?: string[] };
 };
 export type Chat = {
@@ -58,4 +71,6 @@ export type Chat = {
   messages: Message[];
   session_id: string | null;
   updated_at: string;
+  version?: number;
+  messages_loaded?: boolean;
 };

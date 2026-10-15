@@ -77,6 +77,7 @@ class GraphExtractor:
         entities, relations = [], []
         self.last_status = "FAILED"
         self.successful_batches = self.failed_batches = 0
+        self.rejected_relations = 0
         try:
             batches = list(self._batches(chunks))
             logger.info("Graph extraction started for document %s: %s chunks in %s batches",
@@ -97,11 +98,13 @@ class GraphExtractor:
                 for source_batch, result in extracted:
                     entities.extend(item.model_dump() for item in result.entities)
                     known_types = {item.name.casefold(): item.type.upper() for item in result.entities}
-                    default_chunk = source_batch[0].metadata["chunk_id"]
-                    batch_ids = {chunk.metadata["chunk_id"] for chunk in source_batch}
                     for item in result.relations:
                         data = item.model_dump()
-                        data["chunk_id"] = data["chunk_id"] if data["chunk_id"] in batch_ids else default_chunk
+                        source_id = self._evidence_chunk(item, source_batch)
+                        if source_id is None:
+                            self.rejected_relations += 1
+                            continue
+                        data["chunk_id"] = source_id
                         data["source_type"] = known_types.get(item.source.casefold())
                         data["target_type"] = known_types.get(item.target.casefold())
                         relations.append(data)
@@ -114,6 +117,9 @@ class GraphExtractor:
                 self.last_status = "PARTIAL" if self.successful_batches else "FAILED"
                 return False
             self.repository.replace_document_graph(document_id, entities, relations, document_name)
+            if self.rejected_relations:
+                logger.info('Graph extraction omitted %s relations without literal source provenance for document %s',
+                            self.rejected_relations, document_id)
             self.last_status = "COMPLETED"
             logger.info("Graph extraction completed for document %s: %s entities, %s relations",
                         document_id, len(entities), len(relations))
@@ -121,6 +127,18 @@ class GraphExtractor:
         except Exception:
             logger.exception("Graph persistence failed for document %s; vector index remains available", document_id)
             return False
+
+    @staticmethod
+    def _evidence_chunk(relation, chunks):
+        """Keep literal provenance; an invented ID never selects a default file."""
+        quote = ' '.join(relation.evidence.casefold().split())
+        if not quote:
+            return None
+        matches = [chunk.metadata['chunk_id'] for chunk in chunks
+                   if quote in ' '.join(chunk.page_content.casefold().split())]
+        if relation.chunk_id in matches:
+            return relation.chunk_id
+        return matches[0] if len(matches) == 1 else None
 
     @staticmethod
     def _batches(chunks):
@@ -168,7 +186,12 @@ class GraphExtractor:
                 "a CONCEPT, but never create entities for isolated operators such as +, =, ≤ or arrows. "
                 "Only include relations supported by explicit evidence. Keep the graph compact: return at most 20 "
                 "important entities and 24 important relations for this batch, omit generic/repeated mentions, and "
-                "limit each evidence excerpt to 120 characters. Return only the requested JSON."
+                "limit each evidence excerpt to 120 characters, copied verbatim from its chunk. "
+                "Preserve the direction implied by the predicate: A USES B means A uses B; A SIGNED_BY B "
+                "means B signed A. Russian word order does not determine the actor: 'Проект Альфа курирует Анна' "
+                "means Анна CURATES Альфа, not Альфа CURATES Анна. Use nominative entity names. "
+                "Do not infer location, ownership or causality from incidental co-occurrence. "
+                "If the direction or relation is unclear, omit that relation. Return only the requested JSON."
             )}, {"role": "user", "content": content}],
             schema=GRAPH_OUTPUT_SCHEMA,
             thinking=False, temperature=0, max_tokens=GRAPH_LLM_NUM_PREDICT,

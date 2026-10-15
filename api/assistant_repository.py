@@ -17,6 +17,10 @@ class AssistantRepository:
         with closing(self.connection_factory()) as conn, conn:
             conn.execute('BEGIN IMMEDIATE')
             conn.execute('CREATE TABLE IF NOT EXISTS assistant_migrations (version INTEGER PRIMARY KEY)')
+            conn.execute('''CREATE TABLE IF NOT EXISTS assistant_responses (
+                task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, request_id TEXT,
+                request_fingerprint TEXT NOT NULL, response TEXT NOT NULL,
+                UNIQUE(session_id, request_id))''')
             if conn.execute('SELECT 1 FROM assistant_migrations WHERE version=1').fetchone():
                 conn.execute('''CREATE TABLE IF NOT EXISTS assistant_pending_plans (
                     session_id TEXT PRIMARY KEY REFERENCES assistant_sessions(id) ON DELETE CASCADE,
@@ -148,6 +152,57 @@ class AssistantRepository:
     def get_task(self, task_id):
         with closing(self.connection_factory()) as conn:
             return self._decode(Task, conn.execute('SELECT * FROM assistant_tasks WHERE id=?', (task_id,)).fetchone())
+
+    @staticmethod
+    def _request_fingerprint(request):
+        return json.dumps({'question': request.question, 'workspace_id': request.workspace_id,
+            'graph_selection': request.graph_selection.model_dump(mode='json') if request.graph_selection else None},
+            sort_keys=True, ensure_ascii=False)
+
+    def saved_response(self, session_id, request):
+        if not request.request_id:
+            return None
+        with closing(self.connection_factory()) as conn:
+            row = conn.execute('SELECT r.* FROM assistant_responses r JOIN assistant_tasks t ON t.id=r.task_id '
+                "WHERE r.session_id=? AND r.request_id=? AND t.status='COMPLETED'",
+                (session_id, request.request_id)).fetchone()
+        if not row:
+            return None
+        if row['request_fingerprint'] != self._request_fingerprint(request):
+            raise ValueError('Request id was already used for another question or source')
+        from pydantic_models import QueryResponse
+        response = QueryResponse.model_validate_json(row['response'])
+        response.task_status = TaskStatus.COMPLETED
+        response.actions = self.actions(row['task_id'])
+        return response
+
+    def save_response(self, request, response, task):
+        """Commit visible chat, inference history and recoverable result together."""
+        from chat_store import ensure_chat_schema, append_response
+        from db_utils import get_knowledge_epoch
+        from llm_contract import current_scope, GenerationCancelled
+        now = utc_now()
+        with closing(self.connection_factory()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            ensure_chat_schema(conn)
+            response.chat_version = append_response(conn, request, response)
+            conn.execute('INSERT INTO application_logs(session_id,user_query,gpt_response,model,knowledge_epoch) '
+                'VALUES(?,?,?,?,?)', (response.session_id, request.question, response.answer,
+                                     request.model.value, get_knowledge_epoch(conn)))
+            scope = current_scope.get()
+            if scope and scope.cancelled.is_set():
+                raise GenerationCancelled()
+            changed = conn.execute("UPDATE assistant_tasks SET status='COMPLETED',completed_at=? WHERE id=? AND status='RUNNING'",
+                                   (now, task.id))
+            if changed.rowcount != 1:
+                raise ValueError('Task changed while saving the response')
+            conn.execute('UPDATE assistant_sessions SET updated_at=? WHERE id=?', (now, response.session_id))
+            response.task_status = TaskStatus.COMPLETED
+            conn.execute('INSERT INTO assistant_responses(task_id,session_id,request_id,request_fingerprint,response) '
+                'VALUES(?,?,?,?,?)', (response.task_id, response.session_id, request.request_id,
+                    self._request_fingerprint(request), response.model_dump_json()))
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = now
 
     def actions(self, task_id):
         with closing(self.connection_factory()) as conn:

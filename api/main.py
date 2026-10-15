@@ -8,7 +8,8 @@ import asyncio
 import threading
 import base64
 import json
-from fastapi import FastAPI, File, UploadFile, HTTPException, Body, Response
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body, Response, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import logging
@@ -37,13 +38,26 @@ from tts_provider import TTSUnavailable, tts_provider
 from llm_contract import GenerationCancelled, current_token_sink
 from document_service import DocumentService, create_document_schema
 from index_transactions import IndexTransactions
+from local_access import LocalAccessMiddleware
 
 
 
 # Загружаем .env
 load_dotenv()
 logger = logging.getLogger(__name__)
-app = FastAPI()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Also clean up a partially completed startup, before a request is served.
+    try:
+        await start_model_services()
+        yield
+    finally:
+        await stop_model_services()
+
+
+app = FastAPI(title="Фортуна", lifespan=lifespan)
 
 from agent_steps import router as agent_router
 app.include_router(agent_router)
@@ -52,6 +66,7 @@ app.include_router(chat_router)
 from graph_routes import router as graph_router
 app.include_router(graph_router)
 
+app.add_middleware(LocalAccessMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -63,7 +78,7 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type"],
+    allow_headers=["Accept", "Content-Type", "X-Fortuna-Token", "X-Fortuna-Client"],
 )
 
 GDRIVE_EXTRACTOR = None
@@ -71,7 +86,7 @@ _drive_lock = asyncio.Lock()
 embedding_migration_task = None
 create_document_schema()
 document_service = DocumentService(
-    index=lambda *args: index_document_to_chroma(*args),
+    index=lambda *args, **kwargs: index_document_to_chroma(*args, **kwargs),
     insert=lambda *args: insert_document_record(*args),
     delete_record=lambda *args: delete_document_record(*args),
     store_getter=lambda: __import__('chroma_utils').vectorstore,
@@ -95,7 +110,6 @@ async def migrate_embedding_spaces():
     except Exception:
         logger.exception('Embedding index migration unavailable; legacy index preserved for retry')
 
-@app.on_event("startup")
 async def start_model_services():
     global embedding_migration_task
     try:
@@ -112,25 +126,51 @@ async def start_model_services():
     embedding_migration_task = asyncio.create_task(migrate_embedding_spaces())
 
 
-@app.on_event("shutdown")
 async def stop_model_services():
+    global embedding_migration_task
     if embedding_migration_task:
         embedding_migration_task.cancel()
         await asyncio.gather(embedding_migration_task, return_exceptions=True)
+        embedding_migration_task = None
     provider = get_llm_provider()
-    await asyncio.to_thread(provider.close)
-    await asyncio.to_thread(provider.manager.stop)
-    embeddings = get_embedding_provider()
-    if embeddings.manager:
-        await asyncio.to_thread(embeddings.manager.stop)
+    try:
+        await asyncio.to_thread(provider.close)
+    finally:
+        try:
+            if provider.manager:
+                await asyncio.to_thread(provider.manager.stop)
+        finally:
+            embeddings = get_embedding_provider()
+            if embeddings.manager:
+                await asyncio.to_thread(embeddings.manager.stop)
 
 
 @app.get("/api/model-status")
 async def model_status():
     from model_profiles import PROFILES, get_profile
+    from chat_model_selection import selection_status
     status = await asyncio.to_thread(get_llm_provider().health)
-    return {**status, 'profiles': list(PROFILES), 'default_profile': get_profile().name,
+    return {**status, **selection_status(), 'profiles': list(PROFILES), 'default_profile': get_profile().name,
             'message': 'Модель готова' if status['ready'] else status.get('error') or 'Запуск модели...'}
+
+
+from pydantic import BaseModel
+
+
+class ChatModelSelectionInput(BaseModel):
+    model_id: str
+
+
+@app.post('/api/chat-model')
+async def select_chat_model(request: ChatModelSelectionInput):
+    from chat_model_selection import switch_chat_model
+    async with assistant_core.deployment_lock:
+        if assistant_core.active_tasks:
+            raise HTTPException(status_code=409, detail='Дождитесь завершения текущего ответа перед сменой модели.')
+        try:
+            return await asyncio.to_thread(switch_chat_model, request.model_id, get_llm_provider())
+        except AssistantError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 @app.post("/assistant/tasks/{task_id}/cancel")
@@ -284,10 +324,25 @@ async def workspace_index(workspace_id: str, path: str = ""):
 
 
 @app.post("/workspaces/{workspace_id}/vector-sync")
-async def sync_workspace_vectors(workspace_id: str):
+async def sync_workspace_vectors(workspace_id: str, extract_relations: bool = Query(default=True)):
     try:
-        result = await asyncio.to_thread(workspace_vector_index.sync, workspace_id)
+        if extract_relations:
+            result = await asyncio.to_thread(workspace_vector_index.sync, workspace_id)
+        else:
+            result = await asyncio.to_thread(workspace_vector_index.sync, workspace_id, extract_relations=False)
         return result.__dict__
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ValueError, FileNotFoundError, PermissionError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/workspaces/{workspace_id}/index-status")
+async def workspace_index_status(workspace_id: str):
+    try:
+        scan = await asyncio.to_thread(filesystem_provider.sync_index, workspace_id)
+        status = await asyncio.to_thread(workspace_vector_index.status, workspace_id)
+        return {**status, 'truncated': scan.truncated, 'scan_errors': len(scan.errors)}
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except (ValueError, FileNotFoundError, PermissionError, OSError) as exc:
@@ -302,14 +357,17 @@ async def query_endpoint(query_input: QueryInput, response: Response):
     return result
 
 
-@app.post("/assistant/live")
-async def live_query_endpoint(query_input: QueryInput):
+@app.post("/assistant/stream")
+async def stream_query_endpoint(query_input: QueryInput):
     """Stream conversational model tokens and expose cancellation early."""
     queue: asyncio.Queue = asyncio.Queue(maxsize=256)
     task_id: str | None = None
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
     streamed: list[str] = []
+    disconnected = threading.Event()
+    pending_puts = set()
+    puts_lock = threading.Lock()
 
     async def publish(item):
         await queue.put(item)
@@ -329,19 +387,31 @@ async def live_query_endpoint(query_input: QueryInput):
     def publish_token(value: str):
         if not value:
             return
-        streamed.append(value)
+        if disconnected.is_set():
+            raise GenerationCancelled()
         item = {"type": "token", "text": value}
         if threading.get_ident() == loop_thread:
             queue.put_nowait(item)
+            streamed.append(value)
             return
+        with puts_lock:
+            if disconnected.is_set():
+                raise GenerationCancelled()
+            future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+            pending_puts.add(future)
         try:
-            asyncio.run_coroutine_threadsafe(queue.put(item), loop).result(timeout=30)
-        except Exception:
-            logger.debug("Live token consumer is no longer available")
+            future.result(timeout=30)
+            streamed.append(value)
+        except Exception as exc:
+            future.cancel()
+            raise GenerationCancelled() from exc
+        finally:
+            with puts_lock:
+                pending_puts.discard(future)
 
     async def run():
         nonlocal task_id
-        token = current_token_sink.set(publish_token)
+        token = current_token_sink.set(publish_token if query_input.live_mode and not query_input.workspace_id else None)
         try:
             await publish({"type": "stage", "stage": "thinking"})
             def started(task):
@@ -349,8 +419,8 @@ async def live_query_endpoint(query_input: QueryInput):
                 task_id = task.id
                 queue.put_nowait({"type": "task", "task_id": task.id})
             response, _ = await assistant_core.process_input(
-                query_input.model_copy(update={"live_mode": True}),
-                source="voice", on_task_started=started,
+                query_input,
+                source="voice" if query_input.live_mode else "text", on_task_started=started,
             )
             if not streamed:
                 await publish({"type": "stage", "stage": "answering"})
@@ -373,7 +443,8 @@ async def live_query_endpoint(query_input: QueryInput):
             current_token_sink.reset(token)
             # Completion is part of the protocol, including when the consumer
             # is slow. Disconnect cancels this producer and its pending put.
-            await queue.put(None)
+            if not disconnected.is_set():
+                await queue.put(None)
 
     async def events():
         task = asyncio.create_task(run())
@@ -384,6 +455,12 @@ async def live_query_endpoint(query_input: QueryInput):
                     break
                 yield json.dumps(item, ensure_ascii=False) + "\n"
         finally:
+            # A disconnected consumer cannot drain a full queue. Unblock both
+            # the completion marker and token publishers before joining run().
+            with puts_lock:
+                disconnected.set()
+                for future in pending_puts:
+                    future.cancel()
             if not task.done():
                 if task_id:
                     assistant_core.cancel_task(task_id)
@@ -392,6 +469,11 @@ async def live_query_endpoint(query_input: QueryInput):
 
     return StreamingResponse(events(), media_type="application/x-ndjson",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+@app.post('/assistant/live')
+async def live_query_endpoint(query_input: QueryInput):
+    return await stream_query_endpoint(query_input.model_copy(update={'live_mode': True}))
 
 
 async def read_limited(file):
@@ -458,9 +540,16 @@ async def upload_gdrive_folder(request: UploadGDriveRequest):
                     raise HTTPException(503, "Run api/gdrive_auth.py to authorize Google Drive first")
                 GDRIVE_EXTRACTOR = await asyncio.to_thread(GoogleDriveExtractor, str(DATA_DIR / "credentials.json"), token)
             documents = await asyncio.to_thread(GDRIVE_EXTRACTOR.process_folder, request.folder_url)
+            report = getattr(GDRIVE_EXTRACTOR, 'last_report', {})
+            import_report = {key: report.get(key, default) for key, default in (
+                ('attempted', len(documents)), ('failed', []), ('unsupported', 0), ('limited', False))}
+            import_report['failed'] = list(import_report['failed'])
 
         if not documents:
-            raise ValueError("No valid documents extracted from folder")
+            names = ', '.join(str(item.get('name', '')) for item in import_report['failed'])
+            raise HTTPException(422, 'Ни один документ не импортирован. ' +
+                ('Не обработаны: ' + names + '. ' if names else '') +
+                ('Достигнут лимит импорта.' if import_report['limited'] else ''))
 
         # Фикс: Группируем docs по filename, чтобы избежать дублей
         from collections import defaultdict
@@ -484,12 +573,16 @@ async def upload_gdrive_folder(request: UploadGDriveRequest):
                 logging.info(f"Indexed {filename} with {len(docs_group)} docs, file_id {file_id}")
             except ValueError:
                 logging.warning('Failed to index Drive document %s; previous revision preserved', filename)
+                import_report['failed'].append({'id': str(remote_id or ''), 'name': filename, 'error': 'Indexing failed'})
 
         if indexed_count == 0:
-            raise HTTPException(422, "No documents could be indexed")
+            names = ', '.join(str(item.get('name', '')) for item in import_report['failed'])
+            raise HTTPException(422, 'Не удалось проиндексировать документы: ' + names)
         logging.info(f"Successfully indexed {indexed_count} unique files out of {len(grouped_docs)} from Google Drive.")
         return {"message": f"Successfully processed and indexed {indexed_count} unique documents from Google Drive.",
-                "total_unique_files": len(grouped_docs), "indexed_files": indexed_count}
+                "total_unique_files": len(grouped_docs), "indexed_files": indexed_count,
+                'status': 'partial' if import_report['failed'] or import_report['limited'] else 'completed',
+                **import_report}
 
     except HTTPException:
         raise
@@ -629,6 +722,7 @@ assistant_core = AssistantCore(
     history_loader=lambda session_id: get_chat_history(session_id),
     conversation_resolver=ConversationResolver(),
     agent_planner=LLMAgentPlanner(),
+    response_saver=assistant_repository.save_response,
 )
 
 

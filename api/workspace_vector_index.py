@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from langchain_core.documents import Document
 from index_transactions import IndexTransactions, consistent_read, invalidate_index, serialized_mutation, index_lock
+from file_policy import is_secret_file
 
 
 @dataclass
@@ -38,8 +39,19 @@ class WorkspaceVectorIndex:
     def file_key(workspace_id: str, relative_path: str) -> str:
         return hashlib.sha256(f"{workspace_id}:{relative_path}".encode("utf-8")).hexdigest()
 
+    @consistent_read
+    def status(self, workspace_id: str) -> dict:
+        self.repository.get(workspace_id)
+        records = [item for item in self.repository.indexed_files(workspace_id) if item.readable]
+        return {
+            'readable_documents': len(records),
+            'indexed_documents': sum(bool(item.content_hash and item.vector_status == 'INDEXED'
+                                          and item.vector_hash == item.content_hash) for item in records),
+            'failed_documents': sum(item.vector_status == 'FAILED' for item in records),
+        }
+
     @serialized_mutation
-    def sync(self, workspace_id: str) -> WorkspaceVectorSync:
+    def sync(self, workspace_id: str, *, extract_relations: bool = True) -> WorkspaceVectorSync:
         self.filesystem.sync_index(workspace_id)
         store = self.vectorstore_getter()
         result = WorkspaceVectorSync()
@@ -67,7 +79,7 @@ class WorkspaceVectorIndex:
             if not item.readable or not item.content_hash:
                 continue
             vector_current = item.vector_status == "INDEXED" and item.vector_hash == item.content_hash
-            graph_current = (self.graph_repository is None or
+            graph_current = (not extract_relations or self.graph_repository is None or
                              (item.graph_status == "INDEXED" and item.graph_hash == item.content_hash))
             if vector_current and graph_current:
                 result.unchanged += 1
@@ -100,8 +112,25 @@ class WorkspaceVectorIndex:
                         store, 'workspace_collection', {"workspace_file_key": key}, chunks, ids, commit=commit
                     )
                     result.indexed += 1
-                if self.graph_repository is not None and not graph_current:
+                if extract_relations and self.graph_repository is not None and not graph_current:
                     try:
+                        if vector_current:
+                            # A graph retry must use the committed revision,
+                            # including its storage IDs, rather than newly split
+                            # chunks whose IDs do not exist in Chroma.
+                            stored_chunks = store.get(
+                                where={"workspace_file_key": key},
+                                include=["documents", "metadatas"],
+                            )
+                            chunks = [Document(page_content=content, metadata={
+                                **(metadata or {}), "chunk_id": chunk_id,
+                            }) for chunk_id, content, metadata in zip(
+                                stored_chunks.get("ids") or [],
+                                stored_chunks.get("documents") or [],
+                                stored_chunks.get("metadatas") or [],
+                            )]
+                            if not chunks:
+                                raise RuntimeError('Committed vector chunks are unavailable; retry required')
                         if self.graph_extractor_factory:
                             extractor = self.graph_extractor_factory(workspace_id)
                         else:
@@ -144,23 +173,10 @@ class WorkspaceVectorIndex:
         output = [{
             "path": document.metadata.get("relative_path") or document.metadata.get("source", ""),
             "content": document.page_content, "score": 1.0, "matched": [],
+            "chunk_id": document.metadata.get('chunk_id', ''),
             "found_by": ["workspace_semantic"],
-        } for document in documents if document.page_content.strip()]
-        if self.graph_repository is not None:
-            relations = self.graph_repository.search(workspace_id, question, limit=limit * 2)
-            chunk_ids = list(dict.fromkeys(row["chunk_id"] for row in relations if row.get("chunk_id")))
-            if chunk_ids:
-                stored = store.get(ids=chunk_ids, include=["documents", "metadatas"])
-                graph_items = []
-                for index, chunk_id in enumerate(stored.get("ids") or []):
-                    metadata = (stored.get("metadatas") or [])[index] or {}
-                    content = (stored.get("documents") or [])[index] or ""
-                    graph_items.append({
-                        "path": metadata.get("relative_path") or metadata.get("source", ""),
-                        "content": content, "score": 2.0, "matched": [],
-                        "found_by": ["workspace_graph"],
-                    })
-                output = graph_items + output
+        } for document in documents if document.page_content.strip()
+            and not is_secret_file(document.metadata.get('relative_path') or document.metadata.get('source', ''))]
         unique = []
         seen = set()
         for item in output:
@@ -170,3 +186,41 @@ class WorkspaceVectorIndex:
             if len(unique) >= limit:
                 break
         return unique
+
+    @consistent_read
+    def graph_context(self, workspace_id: str, question: str, limit: int = 3):
+        from graph_retrieval import graph_search
+        from settings import GRAPH_RETRIEVAL_ENABLED
+        if not GRAPH_RETRIEVAL_ENABLED:
+            return None
+        store = self.vectorstore_getter()
+        if store is None:
+            return None
+        IndexTransactions(self.repository.connection_factory).recover({'workspace_collection': store})
+        results = graph_search(store, question, limit, workspace_id=workspace_id,
+                               connection_factory=self.repository.connection_factory, filesystem=self.filesystem)
+        if results is None:
+            return None
+        return [{'path': r.metadata['relative_path'], 'content': r.text, 'chunk_id': r.chunk_id,
+                 'score': r.score, 'matched': [], 'found_by': r.found_by,
+                 'graph_anchor': r.metadata['graph_anchor'], 'graph_path': r.metadata['graph_path'],
+                 'graph_fast_path': True} for r in results]
+
+    @consistent_read
+    def expand_context(self, workspace_id: str, matches: list[dict], question=None) -> list[dict]:
+        from hybrid_context_extractor import SearchResult
+        from semantic_graph import automatic_graph_sources
+        from settings import GRAPH_RETRIEVAL_ENABLED
+        if question is not None and not GRAPH_RETRIEVAL_ENABLED:
+            return []
+        seeds = [SearchResult(f'workspace:{workspace_id}:{item["path"]}',
+                              item.get('chunk_id', ''), item['content'],
+                              {'relative_path': item['path'], 'workspace_id': workspace_id})
+                 for item in matches]
+        additions = automatic_graph_sources(self.vectorstore_getter(), seeds, question=question,
+            workspace_id=workspace_id, connection_factory=self.repository.connection_factory,
+            filesystem=self.filesystem)
+        return [{'path': item.metadata['relative_path'], 'content': item.text,
+                 'chunk_id': item.chunk_id, 'score': item.score, 'matched': [],
+                 'found_by': item.found_by, 'graph_anchor': item.metadata['graph_anchor']}
+                for item in additions]

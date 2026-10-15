@@ -39,12 +39,18 @@ GRAPH_LLM_NUM_CTX = FAST_LLM_NUM_CTX
 GRAPH_LLM_NUM_PREDICT = max(256, int(os.getenv('GRAPH_LLM_NUM_PREDICT', '1400')))
 MAX_GRAPH_DEPTH = max(1, min(2, int(os.getenv('MAX_GRAPH_DEPTH', '2'))))
 MAX_GRAPH_RESULTS = max(1, int(os.getenv('MAX_GRAPH_RESULTS', '20')))
+# Document similarity is a retrieval hint; a conservative threshold limits drift.
+SEMANTIC_GRAPH_SIMILARITY = max(0.0, min(1.0, float(os.getenv('SEMANTIC_GRAPH_SIMILARITY', '0.82'))))
+SEMANTIC_GRAPH_NEIGHBORS = max(1, min(6, int(os.getenv('SEMANTIC_GRAPH_NEIGHBORS', '3'))))
+GRAPH_RETRIEVAL_ENABLED = os.getenv('GRAPH_RETRIEVAL_ENABLED', 'true').lower() == 'true'
 
-# Answer verification is optional and uses one batched structured-output call.
+# Answer verification is optional; long answers use bounded structured batches.
 VERIFIER_ENABLED = os.getenv('VERIFIER_ENABLED', 'true').strip().casefold() in {'1', 'true', 'yes', 'on'}
-# Routine document QA already has a source-only generation prompt.  The more
-# expensive claim verifier is reserved for routes where exactness or synthesis
-# warrants an additional model pass.  Manual /agent/verify remains explicit.
+ANSWER_REVIEW_MODE = os.getenv('ANSWER_REVIEW_MODE', 'contextual').strip().casefold()
+if ANSWER_REVIEW_MODE not in {'contextual', 'strict'}:
+    raise ValueError('ANSWER_REVIEW_MODE must be contextual or strict')
+# In strict mode, only these knowledge routes use automatic claim verification.
+# Contextual review applies to ordinary sourced chat; /agent/verify stays strict.
 VERIFIER_AUTO_STRATEGIES = frozenset(
     value.strip().upper() for value in os.getenv(
         'VERIFIER_AUTO_STRATEGIES',
@@ -53,6 +59,7 @@ VERIFIER_AUTO_STRATEGIES = frozenset(
 )
 VERIFIER_CONFIDENCE_THRESHOLD = float(os.getenv('VERIFIER_CONFIDENCE_THRESHOLD', '0.55'))
 MAX_VERIFICATION_RETRIES = int(os.getenv('MAX_VERIFICATION_RETRIES', '1'))
+EVIDENCE_AUDIT_BATCH_SIZE = max(1, min(2, int(os.getenv('EVIDENCE_AUDIT_BATCH_SIZE', '2'))))
 VERIFIER_RETRIEVAL_WEIGHT = float(os.getenv('VERIFIER_RETRIEVAL_WEIGHT', '0.30'))
 VERIFIER_CLAIM_SUPPORT_WEIGHT = float(os.getenv('VERIFIER_CLAIM_SUPPORT_WEIGHT', '0.50'))
 VERIFIER_SOURCE_AGREEMENT_WEIGHT = float(os.getenv('VERIFIER_SOURCE_AGREEMENT_WEIGHT', '0.20'))

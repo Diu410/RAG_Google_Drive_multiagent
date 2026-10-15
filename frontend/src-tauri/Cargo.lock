@@ -1911,6 +1911,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-window-state",
  "ureq",
+ "uuid",
  "windows-sys 0.59.0",
 ]
 

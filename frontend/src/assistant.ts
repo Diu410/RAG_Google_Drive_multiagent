@@ -1,4 +1,5 @@
 import {post,streamJsonLines} from './api';
+import type {GraphSelection} from './graphTypes';
 
 export type TaskStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type Session = {
@@ -23,8 +24,10 @@ export type AssistantEvent = {
 export type ExecutionMetadata = {task_id?: string; task_status?: TaskStatus; actions?: Action[]; events?: AssistantEvent[]};
 export type AssistantInput = {
   question: string; session_id?: string | null; chat_id?: string;
+  request_id?: string;
   model: string; use_multi_agent?: boolean; workspace_id?: string | null;
   live_mode?: boolean;
+  graph_selection?: GraphSelection;
 };
 
 // Shared client entry point for chat and future input surfaces.
@@ -34,4 +37,8 @@ export function processAssistantInput<T>(input: AssistantInput) {
 
 export function processAssistantLive<T>(input: AssistantInput,onEvent:(event:{type:string;text?:string;stage?:string;task_id?:string;response?:T;message?:string})=>void,signal?:AbortSignal){
   return streamJsonLines('/assistant/live',input,onEvent,{signal,timeoutMs:10*60*1000});
+}
+
+export function processAssistantStream<T>(input: AssistantInput,onEvent:(event:{type:string;task_id?:string;response?:T;message?:string})=>void,signal?:AbortSignal){
+  return streamJsonLines('/assistant/stream',input,onEvent,{signal,timeoutMs:10*60*1000});
 }

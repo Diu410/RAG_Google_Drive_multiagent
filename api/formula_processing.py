@@ -13,6 +13,8 @@ from xml.etree import ElementTree as ET
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from extraction_limits import (bounded_extraction, check_extraction_budget, ocr_timeout,
+    MAX_DOCX_XML_BYTES, MAX_PDF_PAGES, MAX_OCR_PIXELS, ExtractionLimitError, IncompleteExtractionError)
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +88,15 @@ def _omml_latex(node: ET.Element) -> str:
     return "".join(_omml_latex(child) for child in children)
 
 
+@bounded_extraction
 def load_docx_with_formulas(file_path: str) -> list[Document]:
     """Read Word paragraphs in order and preserve OMML as raw, plain and LaTeX."""
     documents: list[Document] = []
+    with zipfile.ZipFile(file_path) as archive:
+        if (archive.getinfo('word/document.xml').file_size > MAX_DOCX_XML_BYTES
+                or sum(item.file_size for item in archive.infolist()) > MAX_DOCX_XML_BYTES * 2):
+            raise ExtractionLimitError('DOCX unpacked content exceeds size limit')
+    characters = 0
     try:
         with zipfile.ZipFile(file_path) as archive:
             xml = archive.read("word/document.xml")
@@ -96,11 +104,14 @@ def load_docx_with_formulas(file_path: str) -> list[Document]:
         body = root.find(".//w:body", NS)
         paragraphs = list(body.iter(f"{{{W_NS}}}p")) if body is not None else []
         for position, paragraph in enumerate(paragraphs):
+            check_extraction_budget(characters)
+            parents = {child: parent for parent in paragraph.iter() for child in parent}
             parts, latex_parts, raw_formulas = [], [], []
             for child in paragraph.iter():
+                check_extraction_budget()
                 tag = _local(child)
                 if tag in {"oMath", "oMathPara"}:
-                    if any(_local(parent) in {"oMath", "oMathPara"} for parent in _ancestors(paragraph, child)):
+                    if any(_local(parent) in {"oMath", "oMathPara"} for parent in _ancestors(paragraph, child, parents)):
                         continue
                     raw = ET.tostring(child, encoding="unicode")
                     latex = clean_formula_safe_text(_omml_latex(child))
@@ -111,13 +122,15 @@ def load_docx_with_formulas(file_path: str) -> list[Document]:
                         raw_formulas.append(raw)
                     # Descendant math nodes are handled by this top-level node.
                     continue
-                if tag == "t" and not any(_local(parent) in {"oMath", "oMathPara"} for parent in _ancestors(paragraph, child)):
+                if tag == "t" and not any(_local(parent) in {"oMath", "oMathPara"} for parent in _ancestors(paragraph, child, parents)):
                     parts.append(child.text or "")
                 elif tag in {"tab"}:
                     parts.append("\t")
                 elif tag in {"br", "cr"}:
                     parts.append("\n")
             text = clean_formula_safe_text("".join(parts))
+            characters += len(text)
+            check_extraction_budget(characters)
             if not text:
                 continue
             style = paragraph.find("./w:pPr/w:pStyle", NS)
@@ -128,6 +141,8 @@ def load_docx_with_formulas(file_path: str) -> list[Document]:
                 metadata.update({"formula_format": "omml+latex", "formula_latex": "\n".join(latex_parts),
                                  "formula_raw": "\n".join(raw_formulas)})
             documents.append(Document(page_content=text, metadata=metadata))
+    except ExtractionLimitError:
+        raise
     except Exception:
         logger.exception("DOCX structural formula extraction failed; falling back to text extraction")
         from langchain_community.document_loaders import Docx2txtLoader
@@ -156,14 +171,18 @@ def _mathml_latex(node) -> str:
     return "".join(values) or getattr(node, "get_text", lambda *args, **kwargs: "")("", strip=True)
 
 
+@bounded_extraction
 def load_html_with_formulas(file_path: str) -> list[Document]:
     """Preserve MathML structure and existing LaTeX while keeping ordinary HTML text."""
     from bs4 import BeautifulSoup
 
+    if Path(file_path).stat().st_size > MAX_DOCX_XML_BYTES:
+        raise ExtractionLimitError('HTML exceeds extraction size limit')
     raw_html = Path(file_path).read_text(encoding="utf-8", errors="replace")
     soup = BeautifulSoup(raw_html, "html.parser")
     raw_formulas, latex_formulas = [], []
     for math in soup.find_all("math"):
+        check_extraction_budget()
         raw_formulas.append(str(math))
         latex = _mathml_latex(math)
         latex_formulas.append(latex)
@@ -179,21 +198,26 @@ def load_html_with_formulas(file_path: str) -> list[Document]:
     return [Document(page_content=text, metadata=metadata)]
 
 
-def _ancestors(root: ET.Element, target: ET.Element):
-    parents = {child: parent for parent in root.iter() for child in parent}
+def _ancestors(root: ET.Element, target: ET.Element, parents=None):
+    if parents is None:
+        parents = {child: parent for parent in root.iter() for child in parent}
     current = parents.get(target)
     while current is not None:
         yield current
         current = parents.get(current)
 
 
+@bounded_extraction
 def load_pdf_with_formulas(file_path: str) -> list[Document]:
     """Preserve ordered PyMuPDF spans and Unicode math from text-layer PDFs."""
     import fitz
 
     documents: list[Document] = []
     with fitz.open(file_path) as pdf:
+        if len(pdf) > MAX_PDF_PAGES:
+            raise ExtractionLimitError('PDF page count exceeds limit')
         for page_number, page in enumerate(pdf):
+            check_extraction_budget(sum(len(doc.page_content) for doc in documents))
             page_docs = []
             raw = page.get_text("dict", sort=True)
             for block_index, block in enumerate(raw.get("blocks", [])):
@@ -228,6 +252,7 @@ def missing_pdf_pages(documents: list[Document], page_count: int) -> list[int]:
     return [page for page in range(page_count) if page not in covered]
 
 
+@bounded_extraction
 def load_pdf_pages_ocr(file_path: str, page_numbers: list[int]) -> list[Document]:
     """OCR only pages missing from the PDF text layer."""
     if not page_numbers:
@@ -250,11 +275,18 @@ def load_pdf_pages_ocr(file_path: str, page_numbers: list[int]) -> list[Document
     documents: list[Document] = []
     with fitz.open(file_path) as pdf:
         for page_number in page_numbers:
+            check_extraction_budget(sum(len(doc.page_content) for doc in documents))
             # Rendering through PyMuPDF keeps OCR self-contained and avoids the
             # external Poppler dependency required by pdf2image.
-            pixmap = pdf[page_number].get_pixmap(dpi=300, alpha=False)
+            page = pdf[page_number]
+            if (page.rect.width * 300 / 72) * (page.rect.height * 300 / 72) > MAX_OCR_PIXELS:
+                raise ExtractionLimitError('PDF page raster exceeds pixel limit')
+            pixmap = page.get_pixmap(dpi=300, alpha=False)
             image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
-            data = pytesseract.image_to_data(image, lang="rus+eng", output_type=Output.DICT)
+            try:
+                data = pytesseract.image_to_data(image, lang="rus+eng", output_type=Output.DICT, timeout=ocr_timeout())
+            finally:
+                image.close()
             tokens, confidences = [], []
             for token, raw_confidence in zip(data.get("text", []), data.get("conf", [])):
                 try:
@@ -277,15 +309,20 @@ def load_pdf_pages_ocr(file_path: str, page_numbers: list[int]) -> list[Document
     return documents
 
 
+@bounded_extraction
 def load_pdf_complete(file_path: str) -> list[Document]:
     """Extract every PDF page, filling missing text-layer pages with OCR."""
     import fitz
 
     with fitz.open(file_path) as pdf:
         page_count = len(pdf)
+        if page_count > MAX_PDF_PAGES:
+            raise ExtractionLimitError('PDF page count exceeds limit')
         raster_pages = {page for page in range(page_count) if pdf[page].get_images(full=True)}
     try:
         documents = load_pdf_with_formulas(file_path)
+    except ExtractionLimitError:
+        raise
     except Exception:
         logger.exception("PDF text-layer extraction failed; attempting OCR for every page")
         documents = []
@@ -303,8 +340,10 @@ def load_pdf_complete(file_path: str) -> list[Document]:
                        len(ocr_pages), page_count, [page + 1 for page in ocr_pages])
         try:
             documents.extend(load_pdf_pages_ocr(file_path, ocr_pages))
+        except ExtractionLimitError:
+            raise
         except Exception as exc:
-            raise RuntimeError(
+            raise IncompleteExtractionError(
                 f"OCR failed for PDF pages {[page + 1 for page in ocr_pages]}; "
                 "the document was not indexed partially"
             ) from exc
@@ -317,7 +356,7 @@ def load_pdf_complete(file_path: str) -> list[Document]:
     }
     unresolved = set(ocr_pages) - ocr_covered
     if unresolved:
-        raise ValueError(
+        raise IncompleteExtractionError(
             f"OCR returned no text for PDF pages {[page + 1 for page in sorted(unresolved)]}; "
             "the document was not indexed partially"
         )

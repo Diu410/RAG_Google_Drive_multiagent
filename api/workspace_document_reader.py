@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from pathlib import Path
+from extraction_limits import ExtractionLimitError, check_extraction_budget
+from file_policy import is_secret_file, has_credential_content, FilePolicyError
 
 
 PLAIN_TEXT_EXTENSIONS = {
@@ -51,6 +53,8 @@ class WorkspaceDocumentReader:
         raise ValueError(f"Неподдерживаемый формат: {suffix}")
 
     def read(self, path: Path) -> str:
+        if is_secret_file(path) or has_credential_content(path):
+            raise FilePolicyError('Файл с учётными данными исключён из доступа ассистента')
         stat = path.stat()
         key = (str(path), stat.st_mtime_ns, stat.st_size)
         cached = self._cache.get(key)
@@ -67,7 +71,8 @@ class WorkspaceDocumentReader:
         else:
             raise ValueError(f"Неподдерживаемый формат: {suffix}")
         if len(content) > self.max_output_characters:
-            content = content[:self.max_output_characters]
+            raise ExtractionLimitError('Extracted text exceeds size limit; partial content was not returned')
+        check_extraction_budget(len(content))
         self._cache[key] = content
         self._cache.move_to_end(key)
         while len(self._cache) > self.max_cache_entries:

@@ -1,12 +1,11 @@
 {
-  "name": "kontur",
+  "name": "fortuna",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
-    "test:e2e": "playwright test",
     "preview": "vite preview --host 127.0.0.1",
     "desktop:dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
     "desktop:prepare": "powershell -ExecutionPolicy Bypass -File scripts/build-sidecar.ps1",
@@ -17,7 +16,6 @@
     "@radix-ui/react-dropdown-menu": "^2.1.0",
     "@tauri-apps/plugin-dialog": "^2.7.3",
     "@types/katex": "^0.16.8",
-    "@xyflow/react": "^12.11.6",
     "katex": "^0.18.7",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
@@ -28,7 +26,6 @@
     "remark-math": "^6.0.0"
   },
   "devDependencies": {
-    "@playwright/test": "^1.63.0",
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/cli": "^2.8.0",
     "@types/react": "^19.0.0",

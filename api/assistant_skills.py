@@ -86,6 +86,7 @@ class AgentExecutor:
         }
         confirmed_steps = confirmed_steps or set()
         final_parts: list[str] = []
+        workspace_state: dict[str, Any] = {}
         shared = dict(base_inputs or {})
         async with execution.action('PLAN_AGENT', {'objective': plan.objective}) as action:
             action.output = {'steps': [step.model_dump(mode='json') for step in plan.steps]}
@@ -107,8 +108,16 @@ class AgentExecutor:
                     },
                 })
             arguments = dict(shared)
-            arguments.update({key: value for key, value in self._resolve(step.arguments, results).items()
-                              if not key.startswith('_') and key not in {'session_id', 'chat_id', 'workspace_id'}})
+            step_arguments = {key: value for key, value in self._resolve(step.arguments, results).items()
+                              if not key.startswith('_') and key not in {'session_id', 'chat_id', 'workspace_id'}}
+            if step_arguments.get('question') and step_arguments['question'] != shared.get('question'):
+                # Routing and retrieval were derived from the whole objective.
+                # They must not override a different, explicit step subtask.
+                for key in ('_retrieval_question', '_workspace_command_question', '_workspace_plan',
+                            '_workspace_semantic_decision', '_workspace_matches', '_workspace_resolution_error',
+                            '_workspace_context_requested', '_response_budget'):
+                    arguments.pop(key, None)
+            arguments.update(step_arguments)
             skill = self.registry.get(step.skill)
             execute_step = getattr(skill, 'execute_agent_step', None)
             if step.operation == 'execute':
@@ -122,10 +131,18 @@ class AgentExecutor:
             if not result.success:
                 raise AssistantError(result.error or f'Шаг `{step.id}` завершился ошибкой.')
             results[step.id] = result
+            for field, key in (('active_file', '_workspace_active_file'),
+                               ('current_directory', '_workspace_current_directory')):
+                if result.data.get(field) is not None:
+                    shared[key] = result.data[field]
+                    workspace_state[field] = result.data[field]
             if result.data.get('final'):
                 final_parts.append(str(result.data['final']))
         last = results[plan.steps[-1].id]
         data = dict(last.data)
+        for field, value in workspace_state.items():
+            if data.get(field) is None:
+                data[field] = value
         data['final'] = '\n\n'.join(final_parts)
         data.setdefault('context', '')
         data.setdefault('results', [])

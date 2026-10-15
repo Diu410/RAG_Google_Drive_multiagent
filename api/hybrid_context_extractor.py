@@ -6,12 +6,13 @@ import logging
 import math
 import re
 import unicodedata
+import time
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Sequence, Union
 
 from langchain_core.documents import Document
-from settings import FAST_CONTEXT_CHUNKS, FAST_RETRIEVAL_K
+from settings import FAST_CONTEXT_CHUNKS, FAST_RETRIEVAL_K, GRAPH_RETRIEVAL_ENABLED
 from text_normalization import lexical_key
 from index_transactions import consistent_read, index_revision, IndexTransactions
 
@@ -232,7 +233,8 @@ class HybridRetriever:
 
     def __init__(self, base_retriever: Any, vectorstore: Any = None, mode: str = "semantic",
                  needs_history_aware_input: bool = True, result_k: int = FAST_CONTEXT_CHUNKS,
-                 lexical_weight: float = 1.0, query_variants: Sequence[str] | None = None):
+                 lexical_weight: float = 1.0, query_variants: Sequence[str] | None = None,
+                 graph_enabled: bool = GRAPH_RETRIEVAL_ENABLED):
         if mode not in {"semantic", "lexical", "hybrid"}:
             raise ValueError(f"Unsupported search mode: {mode}")
         # A direct vector retriever must retrieve enough candidates to satisfy
@@ -253,13 +255,16 @@ class HybridRetriever:
         self.query_variants = [value.strip() for value in (query_variants or []) if value.strip()]
         self.last_context = ""
         self.last_results: List[SearchResult] = []
+        self.graph_enabled = graph_enabled
+        self.retrieval_info = {}
 
     def _semantic(self, query: str, chat_history: List[Any]) -> List[SearchResult]:
         if self.base_retriever is None:
             return []
         invocation: Any = {"input": query, "chat_history": chat_history} if self.needs_history_aware_input else query
         documents = self.base_retriever.invoke(invocation)
-        return [_result(doc.page_content, doc.metadata) for doc in documents if doc.page_content.strip()]
+        return [_result(doc.page_content, doc.metadata, getattr(doc, 'id', None))
+                for doc in documents if doc.page_content.strip()]
 
     @staticmethod
     def _align_legacy_ids(semantic: List[SearchResult], corpus: Sequence[SearchResult]) -> None:
@@ -288,10 +293,17 @@ class HybridRetriever:
 
     @consistent_read
     def search(self, query: str, chat_history: List[Any] | None = None) -> List[SearchResult]:
+        started = time.perf_counter()
         if self.vectorstore is not None and hasattr(self.vectorstore, '_collection'):
             IndexTransactions().recover({'rag_collection': self.vectorstore})
         chat_history = chat_history or []
-        if len(self.query_variants) > 1:
+        fast = None
+        if self.graph_enabled and self.mode == 'hybrid' and not self.query_variants:
+            from graph_retrieval import graph_search
+            fast = graph_search(self.vectorstore, query, self.result_k)
+        if fast is not None:
+            self.last_results = fast
+        elif len(self.query_variants) > 1:
             rankings = [self._search_once(f"{query}\nОбъект сравнения: {entity}", chat_history)
                         for entity in self.query_variants]
             selected: List[SearchResult] = []
@@ -308,6 +320,18 @@ class HybridRetriever:
             self.last_results = selected
         else:
             self.last_results = self._search_once(query, chat_history)
+        # After a fallback, supplement only a missing part of this question.
+        # Preserve all direct sources and their priority.
+        from semantic_graph import automatic_graph_sources
+        additions = automatic_graph_sources(self.vectorstore, self.last_results, question=query) if (
+            self.graph_enabled and fast is None) else []
+        self.last_results += additions
+        self.retrieval_info = {'method': 'graph' if fast is not None else self.mode,
+                               'embedding_skipped': fast is not None,
+                               'graph_added_source_count': len(additions),
+                               'source_count': len(self.last_results),
+                               'context_characters': sum(len(r.text) for r in self.last_results),
+                               'retrieval_ms': (time.perf_counter() - started) * 1000}
         self.last_context = "\n\n---\n\n".join(item.text for item in self.last_results)
         logger.debug("Search mode=%s variants=%s results=%s", self.mode, len(self.query_variants), len(self.last_results))
         return self.last_results

@@ -62,7 +62,7 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "audio.wav") -> str:
                     beam_size=5,
                 )
                 text = " ".join(seg.text for seg in segments).strip()
-                logger.info(f"Transcribed ({info.language}): {text[:100]}")
+                logger.info('Transcription complete: language=%s characters=%s', info.language, len(text))
                 return text
         except ImportError:
             pass
@@ -74,7 +74,7 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "audio.wav") -> str:
             language=WHISPER_LANGUAGE or None,
         )
         text = result["text"].strip()
-        logger.info(f"Transcribed: {text[:100]}")
+        logger.info('Transcription complete: characters=%s', len(text))
         return text
 
     finally:

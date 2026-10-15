@@ -1,52 +1,207 @@
-import {useCallback,useEffect,useMemo,useState} from 'react';
-import {Background,Controls,Handle,MarkerType,MiniMap,Position,ReactFlow,useEdgesState,useNodesState,type Edge,type Node,type NodeProps} from '@xyflow/react';
-import '@xyflow/react/dist/style.css';
+import {useEffect, useMemo, useRef, useState, type PointerEvent} from 'react';
+import {createParticles, stepLayout, type MapEdge, type MapNode} from './graphLayout';
 import {api} from './api';
+import {graphParams, type GraphLinkExplanation} from './graphTypes';
 import './graph.css';
 
-export type GraphApiNode={id:string;entity_id?:number;document_id?:number;label:string;type:string;metadata:Record<string,unknown>};
-export type GraphProvenance={document_id?:number;document_name?:string|null;chunk_id?:string;evidence?:string;page?:number|null;section?:string|null;source_position?:number|null;text?:string;block_type?:string|null};
-export type GraphApiEdge={id:string;source:string;target:string;relation:string;provenance?:GraphProvenance};
-export type GraphPayload={nodes:GraphApiNode[];edges:GraphApiEdge[];center_ids:string[];truncated:boolean;limit:number;documents?:string[]};
-type FlowData={label:string;entityType:string;apiNode:GraphApiNode;center:boolean};
+export type GraphPayload = {nodes: MapNode[]; edges: MapEdge[];
+  coverage: {documents: number; indexed_documents: number}; truncated: boolean};
 
-const FILTER_TYPES=['PERSON','ORGANIZATION','PROJECT','DOCUMENT','TECHNOLOGY','OTHER'];
-const accent:Record<string,string>={PERSON:'#66866f',ORGANIZATION:'#6f7f91',PROJECT:'#8b7b60',DOCUMENT:'#7d778b',TECHNOLOGY:'#537f7a',PRODUCT:'#867363',DATE:'#817c68',CONCEPT:'#6c8061',OTHER:'#7c817a'};
-const icon:Record<string,string>={PERSON:'●',ORGANIZATION:'▣',PROJECT:'◆',DOCUMENT:'▤',TECHNOLOGY:'⌘',PRODUCT:'◇',DATE:'◷',CONCEPT:'◉',OTHER:'○'};
+export function GraphViewer({graph, query, workspaceId}: {graph: GraphPayload; query: string; workspaceId?: string}) {
+  const particles = useMemo(() => createParticles(graph.nodes), [graph.nodes]);
+  const byId = useMemo(() => new Map(particles.map(node => [node.id, node])), [particles]);
+  const svg = useRef<SVGSVGElement>(null);
+  const [frame, setFrame] = useState(0);
+  const [hovered, setHovered] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [selectedEdge, setSelectedEdge] = useState<MapEdge | null>(null);
+  const [explanation, setExplanation] = useState<GraphLinkExplanation | null>(null);
+  const [linkError, setLinkError] = useState('');
+  const [camera, setCamera] = useState({x: 0, y: 0, zoom: 1});
+  const cameraRef = useRef(camera);
+  cameraRef.current = camera;
+  const heat = useRef(1);
+  const drag = useRef<{id: string | null; x: number; y: number; moved: boolean} | null>(null);
+  const wake = useRef<() => void>(() => {});
 
-function KnowledgeNode({data}:NodeProps<Node<FlowData>>){return <div className={'kg-node '+(data.center?'center':'')} style={{'--node-accent':accent[data.entityType]||accent.OTHER} as React.CSSProperties}><Handle type="target" position={Position.Left}/><span aria-hidden>{icon[data.entityType]||icon.OTHER}</span><div><strong>{data.label}</strong><small>{data.entityType}</small></div><Handle type="source" position={Position.Right}/></div>}
-const nodeTypes={knowledge:KnowledgeNode};
+  useEffect(() => {
+    let disposed = false;
+    setExplanation(null); setLinkError('');
+    if (selectedEdge) {
+      const params = graphParams(workspaceId);
+      params.set('source_id', selectedEdge.source); params.set('target_id', selectedEdge.target);
+      api<GraphLinkExplanation>(`/graph/link?${params}`).then(value => {
+        if (!disposed) setExplanation(value);
+      }).catch(error => {
+        if (!disposed) setLinkError(error instanceof Error ? error.message : 'Связь недоступна. Обновите карту.');
+      });
+    }
+    return () => {disposed = true;};
+  }, [selectedEdge, workspaceId]);
 
-function validPayload(value:unknown):value is GraphPayload{if(!value||typeof value!=='object')return false;const item=value as Partial<GraphPayload>;return Array.isArray(item.nodes)&&Array.isArray(item.edges)&&item.nodes.every(n=>n&&typeof n.id==='string'&&typeof n.label==='string'&&typeof n.type==='string')&&item.edges.every(e=>e&&typeof e.id==='string'&&typeof e.source==='string'&&typeof e.target==='string'&&typeof e.relation==='string')}
+  useEffect(() => {
+    if (!selectedEdge) return;
+    const escape = (event: KeyboardEvent) => {
+      const container = svg.current?.closest('.graph-explorer') || svg.current?.parentElement;
+      if (event.key !== 'Escape' || !(event.target instanceof Node) || !container?.contains(event.target)) return;
+      // The enclosing dialog handles Escape at document capture; close this layer first.
+      event.preventDefault(); event.stopPropagation(); setSelectedEdge(null);
+    };
+    window.addEventListener('keydown', escape, true);
+    return () => window.removeEventListener('keydown', escape, true);
+  }, [selectedEdge]);
 
-function layout(nodes:GraphApiNode[],edges:GraphApiEdge[],centers:string[]):Node<FlowData>[]{
- const adjacent=new Map<string,string[]>();nodes.forEach(n=>adjacent.set(n.id,[]));edges.forEach(e=>{adjacent.get(e.source)?.push(e.target);adjacent.get(e.target)?.push(e.source)});
- const level=new Map<string,number>(),queue=[...centers.filter(id=>adjacent.has(id))];queue.forEach(id=>level.set(id,0));
- while(queue.length){const current=queue.shift()!;for(const next of adjacent.get(current)||[])if(!level.has(next)){level.set(next,(level.get(current)||0)+1);queue.push(next)}}
- const groups=new Map<number,GraphApiNode[]>();nodes.forEach(n=>{const l=level.get(n.id)??Math.max(2,...level.values())+1;groups.set(l,[...(groups.get(l)||[]),n])});
- return nodes.map(n=>{const l=level.get(n.id)??Math.max(2,...level.values())+1;const group=groups.get(l)!;const index=group.findIndex(item=>item.id===n.id);return{id:n.id,type:'knowledge',position:{x:l*260,y:(index-(group.length-1)/2)*125},data:{label:n.label,entityType:n.type,apiNode:n,center:centers.includes(n.id)}}});
+  useEffect(() => {
+    let handle = 0, disposed = false;
+    heat.current = 1; setSelected(null); setHovered(null);
+    setCamera({x: 0, y: 0, zoom: Math.min(1.5, 260 / (35 * Math.sqrt(particles.length) + 40))});
+    const animate = () => {
+      handle = 0;
+      if (disposed || heat.current < .01) return;
+      stepLayout(particles, graph.edges, heat.current);
+      heat.current *= .97; setFrame(value => value + 1);
+      handle = window.requestAnimationFrame(animate);
+    };
+    wake.current = () => {if (!handle && !disposed) handle = window.requestAnimationFrame(animate);};
+    wake.current();
+    return () => {disposed = true; window.cancelAnimationFrame(handle);};
+  }, [particles, graph.edges]);
+
+  function point(clientX: number, clientY: number) {
+    const matrix = svg.current?.getScreenCTM();
+    return matrix ? new DOMPoint(clientX, clientY).matrixTransform(matrix.inverse()) : new DOMPoint();
+  }
+  useEffect(() => {
+    const element = svg.current;
+    if (!element) return;
+    const wheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const cursor = point(event.clientX, event.clientY), old = cameraRef.current;
+      const zoom = Math.max(.2, Math.min(4, old.zoom * Math.exp(-event.deltaY * .001)));
+      setCamera({zoom, x: cursor.x - (cursor.x - old.x) * zoom / old.zoom,
+        y: cursor.y - (cursor.y - old.y) * zoom / old.zoom});
+    };
+    element.addEventListener('wheel', wheel, {passive: false});
+    return () => element.removeEventListener('wheel', wheel);
+  }, []);
+
+  const focus = hovered || selected;
+  const neighbors = new Set<string>(focus ? [focus] : []);
+  if (focus) graph.edges.forEach(edge => {
+    if (edge.source === focus) neighbors.add(edge.target);
+    if (edge.target === focus) neighbors.add(edge.source);
+  });
+  const needle = query.trim().toLocaleLowerCase();
+  const matches = new Set(graph.nodes.filter(node => node.label.toLocaleLowerCase().includes(needle)).map(node => node.id));
+
+  function selectEdge(edge: MapEdge) {
+    setExplanation(null); setLinkError('');
+    setSelectedEdge(old => old?.id === edge.id ? null : edge);
+  }
+
+  function pointerDown(event: PointerEvent<SVGSVGElement>) {
+    if (event.button !== 0) return;
+    if ((event.target as Element).closest('[data-edge-id]')) return;
+    const id = (event.target as Element).closest('[data-node-id]')?.getAttribute('data-node-id') || null;
+    const cursor = point(event.clientX, event.clientY);
+    drag.current = {id, x: cursor.x, y: cursor.y, moved: false};
+    svg.current?.setPointerCapture(event.pointerId);
+    const node = id ? byId.get(id) : undefined;
+    if (node) node.pinned = true;
+  }
+  function pointerMove(event: PointerEvent<SVGSVGElement>) {
+    const active = drag.current;
+    if (!active) return;
+    const cursor = point(event.clientX, event.clientY), dx = cursor.x - active.x, dy = cursor.y - active.y;
+    active.moved ||= Math.hypot(dx, dy) > 2;
+    const node = active.id ? byId.get(active.id) : undefined;
+    if (node) {
+      node.x += dx / cameraRef.current.zoom; node.y += dy / cameraRef.current.zoom;
+      heat.current = Math.max(heat.current, .2); wake.current(); setFrame(value => value + 1);
+    } else setCamera(old => ({...old, x: old.x + dx, y: old.y + dy}));
+    active.x = cursor.x; active.y = cursor.y;
+  }
+  function pointerUp(event: PointerEvent<SVGSVGElement>) {
+    const active = drag.current;
+    if (active) {
+      const node = active.id ? byId.get(active.id) : undefined;
+      if (node) node.pinned = false;
+      if (!active.moved) setSelected(old => old === active.id ? null : active.id);
+    }
+    drag.current = null;
+    if (svg.current?.hasPointerCapture(event.pointerId)) svg.current.releasePointerCapture(event.pointerId);
+  }
+  return <div className="graph-canvas" data-frame={frame} data-settled={heat.current < .01}>
+    <svg ref={svg} viewBox="-500 -300 1000 600" aria-label="Карта связей документов"
+      onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp}>
+      <g className="graph-camera" transform={`translate(${camera.x} ${camera.y}) scale(${camera.zoom})`}>
+        {graph.edges.map(edge => {
+          const a = byId.get(edge.source), b = byId.get(edge.target);
+          if (!a || !b) return null;
+          const active = !focus || edge.source === focus || edge.target === focus;
+          const label = `${a.label} ↔ ${b.label}`;
+          return <g key={edge.id} data-edge-id={edge.id} role="button" tabIndex={0}
+            className={`graph-edge ${active ? '' : 'dimmed'} ${selectedEdge?.id === edge.id ? 'selected' : ''}`}
+            aria-label={`Связь: ${label}`} aria-pressed={selectedEdge?.id === edge.id}
+            onClick={() => selectEdge(edge)}
+            onKeyDown={event => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault(); selectEdge(edge);
+              }
+            }}>
+            <line className="graph-edge-hit" x1={a.x} y1={a.y} x2={b.x} y2={b.y}/>
+            <line className="graph-link" x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+              strokeWidth={Math.max(.8, edge.similarity * 1.5)}/>
+            <title>{label}: близость {edge.similarity.toFixed(3)} · нажмите для пояснения</title>
+          </g>;
+        })}
+        {particles.map(node => {
+          const dimmed = (focus && !neighbors.has(node.id)) || (needle && !matches.has(node.id));
+          return <g key={node.id} data-node-id={node.id} transform={`translate(${node.x} ${node.y})`}
+            className={`graph-note ${dimmed ? 'dimmed' : ''} ${node.id === focus ? 'focused' : ''} ${node.indexed ? '' : 'unindexed'}`}
+            role="button" tabIndex={0} aria-label={node.label} aria-pressed={selected === node.id}
+            onPointerEnter={() => setHovered(node.id)} onPointerLeave={() => setHovered(null)}
+            onFocus={() => setHovered(node.id)} onBlur={() => setHovered(null)}
+            onKeyDown={event => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault(); setSelected(old => old === node.id ? null : node.id);
+              }
+            }}>
+            <circle className="graph-hit" r={20}/>
+            <circle className="graph-dot" r={4 + Math.min(9, Math.sqrt(node.connections) * 2)}/>
+            <text y={21} textAnchor="middle">{node.label.length > 34 ? node.label.slice(0, 31) + '…' : node.label}</text>
+            <title>{node.label}{node.indexed ? ` · ${node.connections} связей` : ' · ещё не проиндексирован'}</title>
+          </g>;
+        })}
+      </g>
+    </svg>
+    {selectedEdge && <aside className="graph-link-explanation" aria-label="Пояснение связи">
+      <div className="graph-link-heading"><strong>Почему документы связаны</strong>
+        <button aria-label="Закрыть пояснение" onClick={() => setSelectedEdge(null)}>×</button></div>
+      <p>Линия означает похожее содержание документов.</p>
+      {!explanation && !linkError && <p role="status">Сравниваю фрагменты…</p>}
+      {linkError && <p className="graph-error" role="alert">{linkError}</p>}
+      {explanation && <>
+        <p>Близость документов: <strong>{explanation.similarity.toFixed(3)}</strong> · порог {explanation.threshold.toFixed(3)}</p>
+        <p>Близость показанных фрагментов: {explanation.passage_similarity.toFixed(3)}</p>
+        {explanation.passages.map(passage => <div className="graph-link-passage" key={passage.chunk_id}>
+          <strong>{passage.label}</strong><blockquote>{passage.text}{passage.truncated && '…'}</blockquote>
+        </div>)}
+        <p className="graph-link-note">Показатель сравнивает содержание по шкале от −1 до 1.
+          Связь может означать общую тему; причинность и противоречия требуют проверки текста.</p>
+        {explanation.sampled && <p className="graph-link-note">Фрагменты выбраны из ограниченной выборки длинных документов.</p>}
+      </>}
+    </aside>}
+    <div className="graph-view-controls">
+      <button aria-label="Приблизить" onClick={() => setCamera(old => ({...old, zoom: Math.min(4, old.zoom * 1.25)}))}>+</button>
+      <button aria-label="Отдалить" onClick={() => setCamera(old => ({...old, zoom: Math.max(.2, old.zoom / 1.25)}))}>−</button>
+      <button onClick={() => {
+        const radius = Math.max(120, ...particles.map(node => Math.max(Math.abs(node.x), Math.abs(node.y)) + 40));
+        setCamera({x: 0, y: 0, zoom: Math.min(2, 260 / radius)}); setSelected(null);
+      }}>Сбросить вид</button>
+    </div>
+    <p className="graph-hint">{focus ? byId.get(focus)?.label + ' · подсвечены связанные документы' :
+      'Перетаскивайте узлы и карту · колесо — масштаб · нажмите на линию, чтобы увидеть пояснение'}</p>
+    {needle && !matches.size && <p className="graph-no-match">Документы не найдены</p>}
+  </div>;
 }
-
-function toEdges(edges:GraphApiEdge[]):Edge[]{return edges.map(edge=>({id:edge.id,source:edge.source,target:edge.target,label:edge.relation,data:{apiEdge:edge},markerEnd:{type:MarkerType.ArrowClosed},style:{stroke:'#849584'},labelStyle:{fill:'#536557',fontSize:10,fontWeight:650},labelBgStyle:{fill:'#f9fbf7',fillOpacity:.9}}))}
-
-export function GraphViewer({seedEntityIds=[],documentId,onClose}:{seedEntityIds?:number[];documentId?:number;onClose:()=>void}){
- const [rawNodes,setRawNodes]=useState<GraphApiNode[]>([]),[rawEdges,setRawEdges]=useState<GraphApiEdge[]>([]),[centers,setCenters]=useState<string[]>([]);
- const [nodes,setNodes,onNodesChange]=useNodesState<Node<FlowData>>([]),[edges,setEdges,onEdgesChange]=useEdgesState<Edge>([]);
- const [selectedNode,setSelectedNode]=useState<GraphApiNode|null>(null),[selectedEdge,setSelectedEdge]=useState<GraphApiEdge|null>(null);
- const [depth,setDepth]=useState(1),[filters,setFilters]=useState(new Set(FILTER_TYPES)),[loading,setLoading]=useState(true),[error,setError]=useState(''),[truncated,setTruncated]=useState(false);
- const [expanded,setExpanded]=useState(new Set<string>());
- const merge=useCallback((payload:GraphPayload,replace=false)=>{setRawNodes(previous=>{const map=new Map((replace?[]:previous).map(n=>[n.id,n]));payload.nodes.forEach(n=>map.set(n.id,n));return [...map.values()].slice(0,50)});setRawEdges(previous=>{const map=new Map((replace?[]:previous).map(e=>[e.id,e]));payload.edges.forEach(e=>map.set(e.id,e));return [...map.values()].slice(0,50)});setCenters(previous=>[...new Set([...(replace?[]:previous),...(payload.center_ids||[])])]);setTruncated(value=>value||payload.truncated||payload.nodes.length>50||payload.edges.length>50)},[]);
- const load=useCallback(async(path:string,replace=false)=>{setLoading(true);setError('');try{const payload=await api<unknown>(path);if(!validPayload(payload))throw new Error('Сервер вернул некорректный граф.');merge(payload,replace);if(!payload.nodes.length)setError('Связи для выбранного объекта не найдены.');}catch(e){setError(e instanceof Error?e.message:'Граф временно недоступен.');}finally{setLoading(false)}},[merge]);
- useEffect(()=>{const first=seedEntityIds[0];if(first)void load(`/graph/entity/${first}/neighbors?depth=1`,true);else if(documentId)void load(`/graph/document/${documentId}`,true);else{setLoading(false);setError('Выберите сущность или документ для визуализации.')}},[seedEntityIds,documentId,load]);
- useEffect(()=>{const visible=rawNodes.filter(n=>filters.has(FILTER_TYPES.includes(n.type)?n.type:'OTHER'));const ids=new Set(visible.map(n=>n.id));const visibleEdges=rawEdges.filter(e=>ids.has(e.source)&&ids.has(e.target));setNodes(layout(visible,visibleEdges,centers));setEdges(toEdges(visibleEdges));},[rawNodes,rawEdges,filters,centers,setNodes,setEdges]);
- const incident=useMemo(()=>selectedNode?rawEdges.filter(e=>e.source===selectedNode.id||e.target===selectedNode.id):[],[selectedNode,rawEdges]);
- async function expand(){if(!selectedNode?.entity_id)return;const key=`${selectedNode.entity_id}:${depth}`;if(expanded.has(key))return;await load(`/graph/entity/${selectedNode.entity_id}/neighbors?depth=${depth}`);setExpanded(value=>new Set(value).add(key));}
- function toggleFilter(type:string){setFilters(value=>{const next=new Set(value);next.has(type)?next.delete(type):next.add(type);return next})}
- return <div className="graph-shell" aria-label="Граф знаний"><div className="graph-toolbar"><div><strong>Связи GraphRAG</strong><span>{rawNodes.length} узлов · {rawEdges.length} связей</span></div><label>Глубина <select aria-label="Глубина графа" value={depth} onChange={e=>setDepth(Number(e.target.value))}><option value={1}>1 уровень</option><option value={2}>2 уровня</option></select></label><button onClick={onClose}>Закрыть</button></div>
- <div className="graph-filters" aria-label="Фильтры типов">{FILTER_TYPES.map(type=><label key={type}><input type="checkbox" checked={filters.has(type)} onChange={()=>toggleFilter(type)}/>{type}</label>)}</div>
- {truncated&&<div className="graph-notice">Достигнут лимит отображения. Уточните фильтр или раскройте конкретную сущность.</div>}{error&&<div className="graph-error" role="alert">{error}</div>}
- <div className="graph-workspace"><div className="graph-canvas">{loading&&!rawNodes.length?<div className="graph-empty">Загружаю связи…</div>:!rawNodes.length?<div className="graph-empty">Граф пуст</div>:<ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onNodeClick={(_,node)=>{setSelectedNode(node.data.apiNode);setSelectedEdge(null)}} onEdgeClick={(_,edge)=>{setSelectedEdge((edge.data as {apiEdge:GraphApiEdge})?.apiEdge||null);setSelectedNode(null)}} fitView fitViewOptions={{padding:.2,maxZoom:1.25}} minZoom={.25} maxZoom={1.8}><Background gap={22} color="#dfe7da"/><MiniMap pannable zoomable nodeColor={node=>accent[(node.data as FlowData).entityType]||accent.OTHER}/><Controls/></ReactFlow>}</div>
- <aside className="graph-details">{selectedNode?<><span className="node-kind">{selectedNode.type}</span><h3>{selectedNode.label}</h3><p>{incident.length?`Связей: ${incident.length}`:'Связей в текущем отображении нет.'}</p>{selectedNode.entity_id&&<button className="primary" onClick={()=>void expand()} disabled={loading||expanded.has(`${selectedNode.entity_id}:${depth}`)}>{expanded.has(`${selectedNode.entity_id}:${depth}`)?'Связи раскрыты':'Раскрыть связи'}</button>}<h4>Связанные объекты</h4>{incident.map(edge=><button className="relation-row" key={edge.id} onClick={()=>{setSelectedEdge(edge);setSelectedNode(null)}}>{edge.relation}</button>)}</>:selectedEdge?<EdgeDetails edge={selectedEdge}/>:<p>Выберите узел или связь, чтобы увидеть детали.</p>}</aside></div></div>
-}
-
-function EdgeDetails({edge}:{edge:GraphApiEdge}){const p=edge.provenance||{};return <><span className="node-kind">СВЯЗЬ</span><h3>{edge.relation}</h3><dl><dt>Источник</dt><dd>{p.document_name||'Источник не найден'}</dd>{p.page!=null&&<><dt>Страница</dt><dd>{Number(p.page)+1}</dd></>}{p.section&&<><dt>Раздел</dt><dd>{p.section}</dd></>}{p.chunk_id&&<><dt>Chunk</dt><dd>{p.chunk_id}</dd></>}</dl>{p.evidence&&<blockquote>{p.evidence}</blockquote>}{p.text&&<details><summary>Supporting chunk</summary><pre>{p.text}</pre></details>}</>}

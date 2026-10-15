@@ -5,13 +5,14 @@ import re
 from enum import Enum
 
 from pydantic import BaseModel, Field
-from command_intent import requests_file_open, negates_comparison
+from command_intent import requests_file_open, negates_comparison, command_text
 
 
 class WorkspaceOperation(str, Enum):
     FIND_LATEST = "FIND_LATEST_FILE"
     COMPARE_VERSIONS = "COMPARE_FILE_VERSIONS"
     OPEN_SELECTED = "OPEN_FILE"
+    READ_SELECTED = "READ_FILE"
     LIST_FILE_DATES = "LIST_FILE_DATES"
 
 
@@ -55,29 +56,41 @@ class WorkspacePlanner:
 
     def plan(self, text: str, contextual_text: str | None = None) -> WorkspacePlan | None:
         command = (contextual_text or text).strip()
-        if _FILE_DATES.search(command) and not _CONTENT_CONTEXT.search(command):
+        action_text = command_text(command)
+        if _FILE_DATES.search(action_text) and not _CONTENT_CONTEXT.search(command):
             return self.metadata_plan(text, command)
         has_document = bool(_DOCUMENT.search(command))
-        wants_compare = (bool(_COMPARE.search(command)) and has_document and not negates_comparison(text)
+        wants_compare = (bool(_COMPARE.search(action_text)) and has_document and not negates_comparison(text)
                          and bool(re.search(r'\b(?:верси\w*|предыдущ\w*|изменил\w*)\b', command, re.IGNORECASE)))
-        wants_latest = bool(_LATEST.search(command)) and has_document
+        wants_latest = bool(_LATEST.search(action_text)) and has_document
         # Device actions require an explicit verb in the user's actual message;
         # a contextualizer is allowed to resolve the target, not invent consent.
         wants_open = requests_file_open(text)
+        read_commands = command_text(text)
+        wants_read = bool(re.search(r'\b(?:прочитай|прочти|покажи\s+содержимое)\b', read_commands))
+        if re.search(r'\bне\s+(?:прочитай|прочти|читай|показывай)\b', read_commands):
+            wants_read = False
         if not (wants_latest or wants_compare):
             return None
 
-        steps = [WorkspacePlanStep(id="find_latest", operation=WorkspaceOperation.FIND_LATEST)]
-        dependency = "find_latest"
+        explicit_pair = len(re.findall(r'(?<![\w.])\d+(?:\.\d+)*(?![\w.])', command)) == 2
+        steps = ([] if wants_compare and explicit_pair and not wants_latest else
+                 [WorkspacePlanStep(id="find_latest", operation=WorkspaceOperation.FIND_LATEST)])
+        dependency = "find_latest" if steps else None
         if wants_compare:
             steps.append(WorkspacePlanStep(
                 id="compare_versions", operation=WorkspaceOperation.COMPARE_VERSIONS,
-                depends_on=["find_latest"],
+                depends_on=[dependency] if dependency else [],
             ))
             dependency = "compare_versions"
         if wants_open:
             steps.append(WorkspacePlanStep(
                 id="open_selected", operation=WorkspaceOperation.OPEN_SELECTED,
+                depends_on=[dependency],
+            ))
+        if wants_read:
+            steps.append(WorkspacePlanStep(
+                id="read_selected", operation=WorkspaceOperation.READ_SELECTED,
                 depends_on=[dependency],
             ))
         return WorkspacePlan(objective=text, target_query=command, steps=steps)

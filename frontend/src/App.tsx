@@ -34,11 +34,10 @@ import {
   X,
 } from "lucide-react";
 import { api, post, streamJsonLines, upload } from "./api";
-import { processAssistantInput, processAssistantLive } from "./assistant";
+import { processAssistantStream, processAssistantLive } from "./assistant";
 import { useChats } from "./useChats";
 import { useModelStatus } from "./useModelStatus";
-import type { Chat, GraphInfo, Message, SearchResult, Verification } from "./chatTypes";
-const GraphViewer = lazy(() => import("./GraphViewer").then(module => ({ default: module.GraphViewer })));
+import type { Chat, GraphInfo, Message, Verification } from "./chatTypes";
 const GraphExplorer = lazy(() => import("./GraphExplorer").then(module => ({ default: module.GraphExplorer })));
 import "./router.css";
 import "./workspace.css";
@@ -49,16 +48,11 @@ type Doc = {
   upload_timestamp: string;
   can_reindex?: boolean;
 };
-type Workshop = {
-  stage: "draft" | "edit" | "enhance";
-  text: string;
-  edited: string;
-  variants: string[];
-  strategy?: string;
-  question: string;
-  context: string;
-  results: SearchResult[];
+type WorkspaceIndexStatus = {
+  readable_documents: number; indexed_documents: number; failed_documents: number;
+  truncated: boolean; scan_errors: number;
 };
+type WorkspaceIndexResult = {indexed: number; unchanged: number; failed: number; unavailable: boolean};
 type Workspace = {
   id: string;
   name: string;
@@ -139,53 +133,16 @@ function SafeMarkdown({ children }: { children: string }) {
     <MarkdownRenderer>{children}</MarkdownRenderer>
   </Suspense>;
 }
-function GraphDetails({
-  graph,
-  onOpen,
-}: {
-  graph: GraphInfo;
-  onOpen: () => void;
-}) {
-  return (
-    <details>
-      <summary>Связанные сущности и документы</summary>
-      <p>
-        <b>Сущности:</b>{" "}
-        {graph.entities
-          .map((e) => `${e.display_name} — ${e.entity_type}`)
-          .join("; ")}
-      </p>
-      <p>
-        <b>Связи:</b>
-      </p>
-      <ul>
-        {graph.relations.map((r) => (
-          <li key={r.id}>
-            {r.source_name} → {r.relation_type} → {r.target_name}
-            <small>
-              {" "}
-              · источник: {r.document_name || `документ ${r.document_id}`} (
-              {r.chunk_id})
-            </small>
-          </li>
-        ))}
-      </ul>
-      <button className="primary" onClick={onOpen}>
-        Показать связи
-      </button>
-    </details>
-  );
-}
-
 export default function App() {
   const [error, setError] = useState("");
   const report = (error: unknown) => setError(error instanceof Error ? error.message : "Не удалось выполнить действие. Проверьте подключение к серверу.");
-  const { chats, setChats, active, setActive, loaded, load, save } = useChats(report);
-  const { model, setModel, modelStatus } = useModelStatus();
+  const [search, setSearch] = useState("");
+  const { chats, setChats, active, setActive, loaded, loadingChat, load, loadMore, hasMore, loadingMore, save, accept } = useChats(report, search);
+  const { model, setModel, modelStatus, chatModels, selectedChatModel,
+    switchChatModel, switchingModel, modelLoading } = useModelStatus();
   const [sidebar, setSidebar] = useState(window.innerWidth > 760),
     [input, setInput] = useState(""),
     [busy, setBusy] = useState(false);
-  const [mode, setMode] = useState("chat"), [search, setSearch] = useState("");
   const [workspace, setWorkspace] = useState<Workspace | null>(null),
     [workspaceOpen, setWorkspaceOpen] = useState(false),
     [workspaceListing, setWorkspaceListing] = useState<WorkspaceListing | null>(
@@ -193,19 +150,18 @@ export default function App() {
     ),
     [workspaceFile, setWorkspaceFile] = useState<WorkspaceFile | null>(null),
     [workspaceBusy, setWorkspaceBusy] = useState(false);
+  const [workspaceIndexBusy, setWorkspaceIndexBusy] = useState(false);
+  const [workspaceIndexStatus, setWorkspaceIndexStatus] = useState<WorkspaceIndexStatus | null>(null);
+  const [workspaceIndexMessage, setWorkspaceIndexMessage] = useState('');
   const [documentsOpen, setDocumentsOpen] = useState(false),
     [docs, setDocs] = useState<Doc[]>([]),
     [drive, setDrive] = useState(""),
     [files, setFiles] = useState<File[]>([]);
-  const [graphSeed, setGraphSeed] = useState<number[] | null>(null),
-    [graphDocument, setGraphDocument] = useState<number | null>(null),
-    [graphBrowse, setGraphBrowse] = useState(false);
+  const [graphBrowse, setGraphBrowse] = useState(false);
   const [rename, setRename] = useState<Chat | null>(null),
     [renameText, setRenameText] = useState(""),
     [deleting, setDeleting] = useState<Chat | null>(null);
-  const [work, setWork] = useState<Workshop | null>(null),
-    [comment, setComment] = useState(""),
-    [retry, setRetry] = useState<Chat | null>(null),
+  const [retry, setRetry] = useState<Chat | null>(null),
     [retryLive, setRetryLive] = useState(false);
   const [recording, setRecording] = useState(false),
     [live, setLive] = useState(false),
@@ -231,7 +187,7 @@ export default function App() {
     discardRecording = useRef(false),
     partialRequest = useRef(0);
   const chat = chats.find((c) => c.id === active);
-  const locked = busy || !!work || recording;
+  const locked = busy || recording || switchingModel || loadingChat;
   useEffect(() => {
     api<{ configured: boolean; ready: boolean; fallback?: string | null }>(
       "/voice/status",
@@ -261,6 +217,20 @@ export default function App() {
       .catch(() => {});
   }, []);
   useEffect(() => {
+    let disposed = false;
+    if (workspaceOpen && workspace && !workspaceIndexBusy) {
+      setWorkspaceIndexStatus(null);
+      api<WorkspaceIndexStatus>(`/workspaces/${encodeURIComponent(workspace.id)}/index-status`)
+        .then(status => {if (!disposed) setWorkspaceIndexStatus(status);})
+        .catch(error => {if (!disposed) report(error);});
+    }
+    return () => {disposed = true;};
+  }, [workspace?.id, workspaceOpen, workspaceIndexBusy]);
+  useEffect(() => {
+    setWorkspaceIndexStatus(null);
+    setWorkspaceIndexMessage('');
+  }, [workspace?.id]);
+  useEffect(() => {
     liveRef.current = live;
     if (live && !recording && !busy && !liveRunning && !recorder.current)
       void record();
@@ -272,7 +242,6 @@ export default function App() {
     chat?.messages.length,
     chat?.messages.at(-1)?.content,
     busy,
-    work,
   ]);
   function open(c: Chat) {
     setActive(c.id);
@@ -372,6 +341,7 @@ export default function App() {
     type LiveResponse = {
       answer: string;
       session_id: string;
+      chat_version?: number;
       context: string;
       strategy?: string;
       verification?: Verification | null;
@@ -405,9 +375,10 @@ export default function App() {
       ),
     );
     try {
-      await processAssistantLive<LiveResponse>(
-        {
+        await processAssistantLive<LiveResponse>(
+          {
           question: c.messages.at(-1)!.content,
+          request_id: c.messages.at(-1)?.id,
           session_id: c.session_id,
           chat_id: c.id,
           model,
@@ -486,6 +457,7 @@ export default function App() {
         next = {
           ...c,
           session_id: r.session_id,
+          version: r.chat_version ?? c.version,
           messages: [
             ...c.messages,
             {
@@ -500,7 +472,7 @@ export default function App() {
             },
           ],
         };
-      await save(next);
+      accept(await api<Chat>('/chats/' + encodeURIComponent(c.id)).catch(() => next));
       setRetry(null);
       void voiceQueue.current.catch(report).finally(() => {
         if (run === liveRun.current) {
@@ -526,8 +498,6 @@ export default function App() {
     liveAbort.current?.abort();
     stopAudio();
     setVoiceState("Остановлено");
-    setLiveRunning(false);
-    setBusy(false);
     if (taskId)
       try {
         await post(`/assistant/tasks/${encodeURIComponent(taskId)}/cancel`, {});
@@ -536,82 +506,59 @@ export default function App() {
       }
   }
   async function answer(c: Chat, speakAfter = false) {
+    const graphSelection = c.messages.at(-1)?.graphSelection;
+    let controller: AbortController | undefined;
     try {
       setRetry(c);
       setRetryLive(speakAfter);
-      if (speakAfter) {
-        await answerLive(c);
-        return;
-      }
-      if (mode === "workshop") {
-        const r = await post<{
-          result: string;
-          strategy?: string;
-          context: string;
-          results: SearchResult[];
-        }>("/agent/draft", {
-          input: c.messages.at(-1)!.content,
-          chat_history: c.messages.slice(0, -1),
-          model,
-        });
-        setWork({
-          stage: "draft",
-          text: r.result,
-          edited: "",
-          variants: [],
-          strategy: r.strategy,
-          question: c.messages.at(-1)!.content,
-          context: r.context,
-          results: r.results || [],
-        });
-        setRetry(null);
-      } else {
-        const r = await processAssistantInput<{
-          answer: string;
-          session_id: string;
-          context: string;
-          strategy?: string;
-          verification?: Verification | null;
-          graph?: GraphInfo | null;
-          draft: string;
-          edited: string;
-          enhanced: string[];
-        }>({
-          question: c.messages.at(-1)!.content,
-          session_id: c.session_id,
-          chat_id: c.id,
-          model,
-          use_multi_agent: mode === "edit",
-          workspace_id: workspace?.id,
-        });
-        const next = {
-          ...c,
-          session_id: r.session_id,
-          messages: [
-            ...c.messages,
-            {
-              role: "assistant" as const,
-              content: r.answer,
-              timestamp: stamp(),
-              context: r.context,
-              strategy: r.strategy,
-              verification: r.verification,
-              graph: r.graph,
-              steps: { draft: r.draft, edited: r.edited, enhanced: r.enhanced },
-            },
-          ],
-        };
-        await save(next);
-        setRetry(null);
-      }
+      if (speakAfter) {await answerLive(c); return;}
+      controller = new AbortController();
+      liveAbort.current = controller;
+      liveTaskId.current = null;
+      setLiveRunning(true);
+      type Result = {answer:string;session_id:string;chat_version?:number;task_id?:string;context:string;
+        strategy?:string;verification?:Verification|null;graph?:GraphInfo|null;draft:string;edited:string;enhanced:string[]};
+      let result: Result | undefined;
+      await processAssistantStream<Result>({
+        question:c.messages.at(-1)!.content,request_id:c.messages.at(-1)?.id,
+        session_id:c.session_id,chat_id:c.id,model,use_multi_agent:true,
+        workspace_id:graphSelection ? graphSelection.workspace_id : workspace?.id,graph_selection:graphSelection,
+      }, event => {
+        if (event.type === "task" && event.task_id) {liveTaskId.current = event.task_id;setVoiceState('Готовлю ответ…');}
+        if (event.type === "result" && event.response) result = event.response;
+        if (event.type === "error") throw new Error(event.message || "Не удалось завершить ответ.");
+      }, controller.signal);
+      if (!result) throw new Error("Ответ не был завершён.");
+      const r = result;
+      const next: Chat = {...c,session_id:r.session_id,version:r.chat_version ?? c.version,updated_at:stamp(),messages:[...c.messages,{
+        role:"assistant",content:r.answer,timestamp:stamp(),reply_to:c.messages.at(-1)?.id,task_id:r.task_id,
+        context:r.context,strategy:r.strategy,verification:r.verification,graph:r.graph,
+        steps:{draft:r.draft,edited:r.edited,enhanced:r.enhanced},
+      }]};
+      accept(await api<Chat>('/chats/' + encodeURIComponent(c.id)).catch(() => next));
+      setRetry(null);
     } catch (e) {
-      if (!(e instanceof DOMException && e.name === "AbortError")) report(e);
+      // A disconnected response may already be committed. Recover it without generating again.
+      let recovered = false;
+      try {
+        const saved = await api<Chat>("/chats/" + encodeURIComponent(c.id));
+        const requestId = c.messages.at(-1)?.id;
+        if (requestId && saved.messages.some(message => message.reply_to === requestId)) {
+          accept(saved);setRetry(null);recovered = true;
+        }
+      } catch { /* Preserve the original transport error. */ }
+      if (!recovered && !(e instanceof DOMException && e.name === "AbortError")) report(e);
+      if (e instanceof DOMException && e.name === "AbortError") setRetry(null);
     } finally {
+      if (controller && liveAbort.current === controller) {
+        liveAbort.current = null;liveTaskId.current = null;setLiveRunning(false);
+      }
       setBusy(false);
+      if (!speakAfter) setVoiceState('');
     }
   }
   async function submitText(text: string, voice = false) {
-    if (busy || !!work || !loaded || !text.trim()) return;
+    if (busy || loadingChat || !loaded || !text.trim()) return;
     setBusy(true);
     setError("");
     try {
@@ -626,13 +573,13 @@ export default function App() {
         updated_at: stamp(),
         messages: [
           ...(chat?.messages || []),
-          { role: "user", content: text.trim(), timestamp: stamp() },
+          { id:crypto.randomUUID(), role: "user", content: text.trim(), timestamp: stamp() },
         ],
       };
-      await save(c);
-      setActive(c.id);
+      const saved = await save(c);
+      setActive(saved.id);
       setInput("");
-      await answer(c, voice);
+      await answer(saved, voice);
     } catch (e) {
       report(e);
       setBusy(false);
@@ -658,75 +605,6 @@ export default function App() {
       await submitText(text, live);
     } catch (e) {
       report(e);
-      setBusy(false);
-    }
-  }
-  async function finish(text: string) {
-    if (!chat) return;
-    let content = text,
-      verification: Verification | null | undefined;
-    if (work?.results.length) {
-      const r = await post<{
-        result: string;
-        verification?: Verification | null;
-      }>("/agent/verify", {
-        question: work.question,
-        answer: text,
-        strategy: work.strategy || "DOCUMENT_QA",
-        results: work.results,
-        model,
-      });
-      content = r.result;
-      verification = r.verification;
-    }
-    await save({
-      ...chat,
-      messages: [
-        ...chat.messages,
-        {
-          role: "assistant",
-          content,
-          timestamp: stamp(),
-          strategy: work?.strategy,
-          context: work?.context,
-          verification,
-        },
-      ],
-    });
-    setWork(null);
-    setComment("");
-  }
-  async function nextStep() {
-    if (!work || !work.text.trim()) return;
-    setBusy(true);
-    setError("");
-    try {
-      const endpoint = { draft: "edit", edit: "enhance", enhance: "merge" }[
-        work.stage
-      ];
-      const payload =
-        work.stage === "draft"
-          ? { draft: work.text }
-          : work.stage === "edit"
-            ? { edited: work.text }
-            : { edited: work.edited, enhanced: [work.text] };
-      const r = await post<{ result: string; variants: string[] }>(
-        "/agent/" + endpoint,
-        { ...payload, comment, model },
-      );
-      if (work.stage === "enhance") await finish(r.result);
-      else
-        setWork({
-          ...work,
-          stage: work.stage === "draft" ? "edit" : "enhance",
-          text: r.result,
-          edited: work.text,
-          variants: r.variants || [],
-        });
-      setComment("");
-    } catch (e) {
-      report(e);
-    } finally {
       setBusy(false);
     }
   }
@@ -792,6 +670,23 @@ export default function App() {
     } finally {
       setWorkspaceBusy(false);
     }
+  }
+  async function indexWorkspace() {
+    if (!workspace || workspaceIndexBusy) return;
+    const selected = workspace;
+    setWorkspaceIndexBusy(true);
+    setWorkspaceIndexMessage('');
+    setError('');
+    try {
+      const result = await post<WorkspaceIndexResult>(
+        `/workspaces/${encodeURIComponent(selected.id)}/vector-sync?extract_relations=false`, {},
+      );
+      setWorkspaceIndexMessage(result.unavailable ? 'Векторный индекс недоступен. Проверьте embedding-модель.' :
+        `Индексация завершена: обновлено ${result.indexed}, без изменений ${result.unchanged}.` +
+        (result.failed ? ` Ошибок: ${result.failed}. Проверьте embedding-модель и журнал backend.` : '') +
+        ' Откройте граф или обновите карту, чтобы увидеть связи.');
+    } catch (error) {report(error);}
+    finally {setWorkspaceIndexBusy(false);}
   }
   async function toggleLive() {
     if (liveRef.current) {
@@ -962,7 +857,7 @@ export default function App() {
           chat.messages
             .map(
               (m) =>
-                `${m.role === "user" ? "Вы" : "Контур"} · ${date(m.timestamp)}\n\n${m.content}`,
+                `${m.role === "user" ? "Вы" : "Фортуна"} · ${date(m.timestamp)}\n\n${m.content}`,
             )
             .join("\n\n---\n\n"),
         ],
@@ -980,7 +875,7 @@ export default function App() {
         <aside>
           <div className="brand-row">
             <a className="brand" href="#" onClick={(e) => e.preventDefault()}>
-              Контур<span>ВАШ РАБОЧИЙ ЧАТ</span>
+              Фортуна<span>ЛИЧНЫЙ ПОМОЩНИК</span>
             </a>
             <button
               className="icon"
@@ -1089,6 +984,9 @@ export default function App() {
                   </Menu.Root>
                 </div>
               ))}
+            {hasMore && <button disabled={loadingMore || locked} onClick={() => void loadMore()}>
+              {loadingMore ? "Загружаю…" : "Ещё диалоги"}
+            </button>}
             {loaded && !chats.length && (
               <p className="empty-history">Ваши диалоги появятся здесь</p>
             )}
@@ -1110,7 +1008,7 @@ export default function App() {
                 >
                   <MenuIcon />
                 </button>
-                <span className="mini-brand">Контур</span>
+                <span className="mini-brand">Фортуна</span>
               </>
             )}
             <span className="current-title">
@@ -1131,7 +1029,18 @@ export default function App() {
               {modelStatus}
             </small>
             <select
-              aria-label="Модель"
+              aria-label="Локальная модель"
+              value={selectedChatModel}
+              onChange={(e) => void switchChatModel(e.target.value).catch(report)}
+              disabled={locked || liveRunning || modelLoading || !chatModels.length}
+            >
+              {!chatModels.length && <option value="">Модели загружаются...</option>}
+              {chatModels.map((choice) => <option key={choice.id} value={choice.id} disabled={!choice.available}>
+                {choice.label}{!choice.available ? ' · не установлена' : ''}
+              </option>)}
+            </select>
+            <select
+              aria-label="Профиль ответа"
               value={model}
               onChange={(e) => setModel(e.target.value)}
               disabled={locked}
@@ -1163,7 +1072,7 @@ export default function App() {
           {chat?.messages.map((m, i) => (
             <article className={"message " + m.role} key={i}>
               <div className="message-meta">
-                <strong>{m.role === "user" ? "Вы" : "Контур"}</strong>
+                <strong>{m.role === "user" ? "Вы" : "Фортуна"}</strong>
                 <time>{date(m.timestamp)}</time>
               </div>
               <SafeMarkdown>{m.content}</SafeMarkdown>
@@ -1176,15 +1085,25 @@ export default function App() {
                 <div className="verification">
                   <div>
                     <strong>
-                      {m.strategy === "WORKSPACE_QA"
+                      {m.verification.review_mode === 'CONTEXTUAL'
+                        ? "Сверка с источниками"
+                        : m.strategy === "WORKSPACE_QA"
                         ? "Опора на источники"
                         : m.verification.confidence != null
                         ? `Уверенность: ${Math.round(m.verification.confidence * 100)}%`
                         : "Уверенность: недоступна"}
                     </strong>
                     <span>
-                      Проверка:{" "}
-                      {(
+                        Проверка:{" "}
+                        {m.verification.review_mode === 'CONTEXTUAL' ? ({
+                          SUPPORTED: 'смысловых замечаний не выявлено',
+                          PARTIALLY_SUPPORTED: 'есть интерпретации или неподтверждённые сведения',
+                          UNSUPPORTED: 'есть неподтверждённые утверждения',
+                          CONFLICTING: 'найдены противоречия источникам',
+                          INSUFFICIENT_INFORMATION: 'часть сведений источники не раскрывают',
+                          UNAVAILABLE: 'не завершена; ответ сохранён без подтверждения',
+                        } as Record<string, string>)[m.verification.status] || m.verification.status :
+                        m.verification.answer_scope === 'LIMITED' && ['SUPPORTED', 'PARTIALLY_SUPPORTED'].includes(m.verification.status) ? 'подтверждены отдельные сведения; описание темы ограничено' : (
                         {
                           SUPPORTED: m.strategy === "WORKSPACE_QA"
                             ? "сведения и оговорённые трактовки сверены с источниками"
@@ -1199,6 +1118,9 @@ export default function App() {
                     </span>
                   </div>
                   {m.verification.warning && <p>{m.verification.warning}</p>}
+                  {m.verification.checked_answer && m.verification.checked_answer.trim() !== m.content.trim() && (
+                    <p>Эта проверка относится к другой версии ответа.</p>
+                  )}
                   <details>
                     <summary>Детали проверки</summary>
                     {m.verification.claims.map((c, n) => (
@@ -1214,6 +1136,8 @@ export default function App() {
                           ? ` [${c.source_chunk_ids.join(", ")}]`
                           : ""}
                         {c.evidence_quote && <><br />Цитата: «{c.evidence_quote}»</>}
+                        {c.note && <><br />Замечание: {c.note}</>}
+                        {c.original_text && <><br />До исправления: {c.original_text}</>}
                       </p>
                     ))}
                     {!!m.verification.source_chunk_ids.length && (
@@ -1240,14 +1164,6 @@ export default function App() {
                   </details>
                 </div>
               )}
-              {m.graph && (
-                <GraphDetails
-                  graph={m.graph}
-                  onOpen={() =>
-                    setGraphSeed(m.graph!.entities.map((e) => e.id))
-                  }
-                />
-              )}{" "}
               {m.context && (
                 <details>
                   <summary>Источники ответа</summary>
@@ -1257,6 +1173,7 @@ export default function App() {
               {m.steps?.draft && (
                 <details>
                   <summary>Как создавался ответ</summary>
+                  <p>Черновик до проверки источников; может содержать ошибки.</p>
                   <SafeMarkdown>{m.steps.draft}</SafeMarkdown>
                   <SafeMarkdown>{m.steps.edited || ""}</SafeMarkdown>
                   {m.steps.enhanced?.map((v, n) => (
@@ -1270,7 +1187,7 @@ export default function App() {
           {busy && (
             <div className="thinking" role="status">
               <span />
-              {voiceState || "Контур работает…"}
+              {voiceState || "Фортуна работает…"}
             </div>
           )}
           {recording && input.trim() && (
@@ -1281,75 +1198,6 @@ export default function App() {
               </div>
               <p>{input}</p>
             </article>
-          )}
-          {work && (
-            <section className="workshop">
-              <span className="eyebrow">МАСТЕРСКАЯ ТЕКСТА</span>
-              <h2>
-                {
-                  { draft: "Черновик", edit: "Редактура", enhance: "Варианты" }[
-                    work.stage
-                  ]
-                }
-              </h2>
-              {work.variants.length > 1 && (
-                <select
-                  aria-label="Вариант"
-                  onChange={(e) =>
-                    setWork({
-                      ...work,
-                      text: work.variants[Number(e.target.value)],
-                    })
-                  }
-                >
-                  {work.variants.map((_, i) => (
-                    <option value={i} key={i}>
-                      Вариант {i + 1}
-                    </option>
-                  ))}
-                </select>
-              )}
-              <textarea
-                aria-label="Текст редактора"
-                value={work.text}
-                onChange={(e) => setWork({ ...work, text: e.target.value })}
-              />
-              <input
-                aria-label="Пожелания"
-                placeholder="Что изменить?"
-                value={comment}
-                onChange={(e) => setComment(e.target.value)}
-              />
-              <div className="work-actions">
-                <button
-                  className="primary"
-                  disabled={busy || !work.text.trim()}
-                  onClick={() => void nextStep()}
-                >
-                  {work.stage === "enhance"
-                    ? "Собрать ответ"
-                    : "Следующий этап"}
-                </button>
-                <button
-                  disabled={busy || !work.text.trim()}
-                  onClick={async () => {
-                    setBusy(true);
-                    try {
-                      await finish(work.text);
-                    } catch (e) {
-                      report(e);
-                    } finally {
-                      setBusy(false);
-                    }
-                  }}
-                >
-                  Принять текст
-                </button>
-                <button disabled={busy} onClick={() => setWork(null)}>
-                  Закрыть
-                </button>
-              </div>
-            </section>
           )}
           <div ref={bottom} />
         </div>
@@ -1480,7 +1328,7 @@ export default function App() {
                   className={"live-toggle " + (live ? "active" : "")}
                   aria-label="Потоковый Live-режим с озвучиванием"
                   aria-pressed={live}
-                  disabled={busy || !!work || recording}
+                  disabled={busy || recording}
                   onClick={() => {
                     setLive((v) => !v);
                     setVoiceState("");
@@ -1495,28 +1343,18 @@ export default function App() {
                   aria-label={
                     recording ? "Остановить запись" : "Записать голос"
                   }
-                  disabled={busy || !!work}
+                  disabled={busy}
                   onClick={() => void record()}
                 >
                   {recording ? <Square size={18} /> : <Mic size={19} />}
                 </button>
-                <select
-                  aria-label="Режим ответа"
-                  value={mode}
-                  disabled={locked || live}
-                  onChange={(e) => setMode(e.target.value)}
-                >
-                  <option value="chat">Обычный ответ</option>
-                  <option value="edit">Ответ с редактурой</option>
-                  <option value="workshop">Пошаговая редактура</option>
-                </select>
               </div>
               {liveRunning ? (
                 <button
                   type="button"
                   className="stop-live"
                   onClick={() => void cancelLive()}
-                  aria-label="Остановить Live-ответ"
+                  aria-label={live ? "Остановить Live-ответ" : "Остановить ответ"}
                 >
                   <Square size={17} /> Стоп
                 </button>
@@ -1658,7 +1496,12 @@ export default function App() {
                 e.preventDefault();
                 setBusy(true);
                 try {
-                  await post("/upload-gdrive", { folder_url: drive });
+                  const result = await post<{status:string;indexed_files:number;limited:boolean;failed:{name:string;error:string}[]}>("/upload-gdrive", { folder_url: drive });
+                  if (result.status === 'partial') {
+                    setError(`Импортировано документов: ${result.indexed_files}. ` +
+                      (result.limited ? 'Достигнут лимит импорта. ' : '') +
+                      (result.failed?.length ? 'Не обработаны: ' + result.failed.map(file => file.name).join(', ') : ''));
+                  }
                   setDrive("");
                   await refreshDocs();
                 } catch (e) {
@@ -1754,14 +1597,8 @@ export default function App() {
         </Dialog.Portal>
       </Dialog.Root>
       <Dialog.Root
-        open={graphBrowse || !!graphSeed || graphDocument != null}
-        onOpenChange={(open) => {
-          if (!open) {
-            setGraphBrowse(false);
-            setGraphSeed(null);
-            setGraphDocument(null);
-          }
-        }}
+        open={graphBrowse}
+        onOpenChange={setGraphBrowse}
       >
         <Dialog.Portal>
           <Dialog.Overlay className="overlay" />
@@ -1771,19 +1608,7 @@ export default function App() {
           >
             <Dialog.Title className="sr-only">Граф знаний</Dialog.Title>
             <Suspense fallback={<p role="status">Загружаю граф…</p>}>
-            {graphBrowse ? (
-              <GraphExplorer onClose={() => setGraphBrowse(false)} />
-            ) : graphSeed ? (
-              <GraphViewer
-                seedEntityIds={graphSeed}
-                onClose={() => setGraphSeed(null)}
-              />
-            ) : graphDocument != null ? (
-              <GraphViewer
-                documentId={graphDocument}
-                onClose={() => setGraphDocument(null)}
-              />
-            ) : null}
+              <GraphExplorer workspace={workspace} onClose={() => setGraphBrowse(false)} />
             </Suspense>
           </Dialog.Content>
         </Dialog.Portal>
@@ -1808,12 +1633,16 @@ export default function App() {
             <div className="workspace-toolbar">
               <button
                 className="primary"
-                disabled={workspaceBusy}
+                disabled={workspaceBusy || workspaceIndexBusy}
                 onClick={() => void chooseWorkspace()}
               >
                 <FolderOpen size={16} />
                 {workspace ? "Сменить папку" : "Выбрать папку"}
               </button>
+              {workspace && <button disabled={workspaceBusy || workspaceIndexBusy || locked}
+                onClick={() => void indexWorkspace()}>
+                {workspaceIndexBusy ? 'Индексирую папку…' : 'Индексировать папку'}
+              </button>}
               {workspaceFile ? (
                 <button
                   disabled={workspaceBusy}
@@ -1845,6 +1674,15 @@ export default function App() {
                   "Папка не выбрана"}
               </span>
             </div>
+            {workspace && <p className="workspace-index-status" role="status">
+              {workspaceIndexBusy ? 'Создаю поисковый индекс для файлов и вложенных папок…' :
+                workspaceIndexStatus ? `Проиндексировано ${workspaceIndexStatus.indexed_documents} из ${workspaceIndexStatus.readable_documents} доступных документов.` :
+                  'Проверяю поисковый индекс…'}
+              {!!workspaceIndexStatus?.failed_documents && ` Ошибок индексации: ${workspaceIndexStatus.failed_documents}.`}
+              {workspaceIndexStatus?.truncated && ' Список файлов ограничен; обход папки неполный.'}
+              {!!workspaceIndexStatus?.scan_errors && ' Некоторые файлы или папки недоступны.'}
+            </p>}
+            {workspaceIndexMessage && <p role="status">{workspaceIndexMessage}</p>}
             {error && <p className="error">{error}</p>}
             {workspaceBusy && <p role="status">Читаю содержимое папки…</p>}
             {workspaceFile ? (

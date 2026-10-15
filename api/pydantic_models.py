@@ -29,6 +29,9 @@ class VerificationClaim(BaseModel):
     source_chunk_ids: list[str] = Field(default_factory=list)
     basis: str | None = None
     evidence_quote: str | None = None
+    relevant_to_question: bool = True
+    note: str | None = None
+    original_text: str | None = None
 
 class ConfidenceComponents(BaseModel):
     retrieval: float = Field(ge=0.0, le=1.0)
@@ -44,9 +47,26 @@ class VerificationResult(BaseModel):
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     components: ConfidenceComponents | None = None
     warning: str | None = None
+    checked_answer: str | None = None
+    answer_scope: str | None = None
+    review_mode: str | None = None
+    review_details: dict | None = None
+
+class GraphSelection(BaseModel):
+    workspace_id: str | None = Field(default=None, min_length=1, max_length=128)
+    relation_ids: list[int] = Field(min_length=1, max_length=20)
+
+    @field_validator('relation_ids')
+    @classmethod
+    def positive_unique_relations(cls, values):
+        if any(value <= 0 or value > 9223372036854775807 for value in values):
+            raise ValueError('relation_ids must be positive SQLite IDs')
+        return list(dict.fromkeys(values))
+
 
 class QueryInput(BaseModel):
     question: str = Field(min_length=1, max_length=32000)
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
     session_id: str | None = Field(default=None, max_length=128)
     chat_id: str | None = Field(default=None, min_length=1, max_length=128)
     model: ModelName = Field(default=ModelName(DEFAULT_CHAT_MODEL))
@@ -54,6 +74,7 @@ class QueryInput(BaseModel):
     search_mode: SearchMode | None = Field(default=None)
     workspace_id: str | None = Field(default=None, max_length=128)
     live_mode: bool = Field(default=False)
+    graph_selection: GraphSelection | None = None
 
     @field_validator('question')
     @classmethod
@@ -65,6 +86,7 @@ class QueryInput(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     session_id: str
+    chat_version: int | None = None
     model: ModelName
     context: str
     draft: str = ""

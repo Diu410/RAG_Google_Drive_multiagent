@@ -11,6 +11,30 @@ from pydantic import BaseModel, Field, model_validator
 import model_runtime
 
 
+def is_single_information_request(question: str) -> bool:
+    """Skip workflow planning only for an explicit question without actions.
+
+    Retrieval, source routing and verification still run normally. Ambiguous
+    requests and any requested operation keep the existing planner path.
+    """
+    from command_intent import command_text
+    text = command_text(question).strip()
+    text = re.sub(r'^(?:по\s+(?:документам|файлам|источникам)|согласно\s+(?:документам|файлам))\s*[, :]?\s*',
+                  '', text, flags=re.I)
+    if not re.match(r'^(?:кто|кому|кем|кого|ком|что|чему|чем|чего|каков[аоы]?|какой|какая|какое|какие|какую|каких|'
+                    r'сколько|когда|где|чей|чья|чь[её]|как\s+зовут|'
+                    r'(?:к|ко|с|со|о|об|от|у|для|про|на|за|перед|между|над)\s+'
+                    r'(?:кому|кем|кого|ком|чему|чем|чего|ч[её]м)|'
+                    r'who|what|when|where|how\s+many)\b', text, re.I):
+        return False
+    if text.count('?') > 1 or re.search(r'\b(?:затем|потом|сначала|после\s+этого|then|afterwards)\b', text, re.I):
+        return False
+    return not re.search(r'\b(?:найд\w*|отыщ\w*|поищ\w*|покаж\w*|перечисл\w*|прочит\w*|'
+        r'откро\w*|откры\w*|сравн\w*|удал\w*|переимен\w*|созда\w*|сохран\w*|запиш\w*|'
+        r'состав\w*|сдела\w*|выполн\w*|запуст\w*|постро\w*|find|show|list|read|open|'
+        r'compare|delete|rename|create|save|write|run|execute)\b', text, re.I)
+
+
 class AgentPlanStatus(str, Enum):
     PLANNING = "PLANNING"
     RUNNING = "RUNNING"

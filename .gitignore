@@ -68,20 +68,28 @@ htmlcov/
 *.gguf
 runtime/
 api/models/
+chat-model-selection.json
 frontend/src-tauri/resources/llama/
 frontend/src-tauri/gen/
 
 # Local evaluation output (may include document excerpts)
 /docs/*-evaluation.json
+/.user-evaluation/
+
+# Training output can contain private data when users extend the starter set.
+/.training-output/
+/training/outputs/
+/training/checkpoints/
+/training/private/
+*.safetensors
+*.pt
+*.pth
 
 # Clean source exports and local terminal artifacts
 /publish/
 /terminal/
 
-# Local tests, review reports and publication helpers
-/tests/
-/frontend/tests/
-/frontend/playwright.config.ts
+# Local review reports and publication helpers.
 /frontend/scripts/desktop-inspect.mjs
 /scripts/prepare-main.ps1
 /docs/git-publication.md

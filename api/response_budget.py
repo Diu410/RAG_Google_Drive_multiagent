@@ -71,6 +71,25 @@ class ResponseBudgetPlanner:
             coverage = ContextCoverage.BROAD if _BROAD_RE.search(question) else ContextCoverage.BALANCED
             return BudgetDecision(detail=AnswerDetail.DETAILED, coverage=coverage, confidence=1,
                                   reason="Пользователь явно запросил подробный анализ")
+        from source_grounding import requests_source_overview
+        if requests_source_overview(question) and len(question.split()) <= 12:
+            return BudgetDecision(detail=AnswerDetail.NORMAL,
+                                  coverage=ContextCoverage.BROAD if _BROAD_RE.search(question) else ContextCoverage.BALANCED,
+                                  confidence=1, reason="Короткий вопрос о предмете: прямое объяснение по источникам")
+        from agent_planner import is_single_information_request
+        from source_grounding import factual_query
+        factual = factual_query(question)
+        if (len(factual.split()) <= 30 and is_single_information_request(factual)
+                and not re.search(r'\b(?:почему|объясн\w*|расскаж\w*|опиш\w*)\b', factual, re.I)
+                and (re.match(r'^\s*как\s+зовут\b', factual, re.I)
+                     or re.match(r'^\s*(?:какой|какая|какое|какие|сколько|когда|где)\b', factual, re.I)
+                     and re.search(r'\b(?:рост|нагрузк\w*|масс\w*|вес|телефон\w*|код\w*|номер\w*|'
+                                   r'дат[ауы]|время|имя|стоимост\w*|цен[ауы])\b', factual, re.I))):
+            return BudgetDecision(detail=AnswerDetail.BRIEF, coverage=ContextCoverage.FOCUSED,
+                                  confidence=1, reason="Прямой вопрос об имени или параметрах по источнику")
+        if len(factual.split()) <= 30 and is_single_information_request(factual):
+            return BudgetDecision(detail=AnswerDetail.NORMAL, coverage=ContextCoverage.BALANCED,
+                                  confidence=1, reason="Прямой информационный вопрос по источникам")
         try:
             result = model_runtime.get_llm_provider().structured_generate(
                 profile=model,

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Callable
 from assistant_models import AssistantError, ToolResult
 from pydantic_models import QueryInput
-from query_router import retrieval_plan, QueryStrategy
+from query_router import retrieval_plan, QueryStrategy, RouteDecision
 
 
 @dataclass
@@ -54,7 +54,9 @@ class KnowledgeSkill:
         model = query_input.model.value
         retrieval_question = inputs.get('_retrieval_question') or query_input.question
         async with execution.action('ROUTE_QUERY') as action:
-            route = await asyncio.to_thread(self.services.route, retrieval_question, model)
+            route = (RouteDecision(strategy=QueryStrategy.GRAPH_QUERY, confidence=1.0)
+                     if inputs.get('_graph_focus') else
+                     await asyncio.to_thread(self.services.route, retrieval_question, model))
             action.output = {'strategy': route.strategy.value}
         plan = retrieval_plan(
             route, query_input.search_mode.value if query_input.search_mode is not None else None
@@ -73,25 +75,17 @@ class KnowledgeSkill:
                 answer = await asyncio.to_thread(self.services.general_chat, *arguments)
         result = ({"final": answer or "", "context": "", "strategy": route.strategy.value}
                   if route.strategy == QueryStrategy.GENERAL_CHAT else None)
-        if result is None and query_input.use_multi_agent and not use_graph:
-            try:
-                async with execution.action('MULTI_AGENT_RAG'):
-                    result = await asyncio.to_thread(
-                        self.services.multi_chain(), retrieval_question, history,
-                        model=model, search_mode=plan.mode, result_k=plan.result_k,
-                        lexical_weight=plan.lexical_weight, query_variants=plan.query_variants,
-                    )
-                    result["strategy"] = route.strategy.value
-            except Exception:
-                logging.exception("Multi-agent failed; falling back to single RAG")
         if result is None:
-            async with execution.action('RAG_PIPELINE', {'search_mode': plan.mode, 'use_graph': use_graph}) as action:
+            async with execution.action('RAG_PIPELINE', {'search_mode': plan.mode, 'use_graph': use_graph,
+                                                       'automatic_graph': True}) as action:
+                focus_arguments = {'graph_focus': inputs['_graph_focus']} if inputs.get('_graph_focus') else {}
                 chain = self.services.rag_chain(
                     model=model, search_mode=plan.mode, result_k=plan.result_k,
                     lexical_weight=plan.lexical_weight, query_variants=plan.query_variants,
                     use_graph=use_graph, graph_query=retrieval_question,
                     graph_entities=route.entities, graph_depth=2 if route.strategy == QueryStrategy.DEEP_ANALYSIS else 1,
                     live_mode=query_input.live_mode,
+                    **focus_arguments,
                 )
                 if chain is None:
                     raise AssistantError('RAG unavailable. Check model provider and Chroma.', 503)
@@ -104,23 +98,26 @@ class KnowledgeSkill:
                     "results": [self.services.document_result(d) for d in chain_response.get("context", [])],
                     "strategy": route.strategy.value,
                 }
+                if use_graph:
+                    result["graph"] = chain_response.get("graph")
                 if not result["results"]:
                     result["final"] = "В локальных документах недостаточно информации для ответа."
-                action.output = {'source_count': len(result['results'])}
-            if use_graph:
-                try:
-                    async with execution.action('GRAPH_SEARCH'):
-                        from graph_service import GraphService
-                        graph_result = await asyncio.to_thread(lambda: GraphService().search(
-                            retrieval_question, route.entities,
-                            2 if route.strategy == QueryStrategy.DEEP_ANALYSIS else 1,
-                        ))
-                        result["graph"] = graph_result.as_dict() if graph_result.relations else None
-                except Exception:
-                    logging.exception("Graph metadata unavailable; answer used Hybrid Search fallback")
+                action.output = {'source_count': len(result['results']),
+                                 'graph_fast_path': any(source.get('metadata', {}).get('graph_fast_path')
+                                                        for source in result['results']),
+                                 'graph_source_count': sum('semantic_graph' in source.get('found_by', [])
+                                                           for source in result['results'])}
+        if query_input.use_multi_agent and not query_input.live_mode and result.get('results'):
+            from answer_editing import edit_sourced_answer
+            editing_context = '\n\n'.join(
+                f"[Источник: {(source.get('metadata') or {}).get('source', source.get('document_id', ''))}; "
+                f"chunk: {source.get('chunk_id', '')}]\n{source.get('text', '')}" for source in result['results'])
+            revised = await edit_sourced_answer(query_input.question, result['final'], editing_context, model, execution)
+            result.update(revised)
         verification = None
         if not query_input.live_mode and route.strategy != QueryStrategy.GENERAL_CHAT and result.get("results"):
-            async with execution.action('VERIFY_RESPONSE'):
+            draft = result['final']
+            async with execution.action('VERIFY_RESPONSE') as action:
                 result["final"], verification = await asyncio.to_thread(
                     self.services.verify,
                     query_input.question,
@@ -129,5 +126,9 @@ class KnowledgeSkill:
                     route.strategy.value,
                     model,
                 )
+                action.output = {'checked_answer': result['final'],
+                    'verification': verification.model_dump(mode='json') if verification else None}
+            if result['final'] != draft:
+                result.setdefault('draft', draft)
         result["verification"] = verification
         return ToolResult(success=True, tool=self.name, summary="Knowledge query completed", data=result)

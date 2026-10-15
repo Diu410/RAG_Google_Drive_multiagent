@@ -40,10 +40,12 @@ def fit_prompt(messages, context_size, output_tokens, count):
                     for i, prefix, source in optional if i != history_index]
         tokens = token_count()
     while tokens > input_limit and any(source for _, _, source in optional):
-        # Shrink the largest source block; repeat against the actual tokenizer.
+        # Jump closer to the budget for very oversized prompts. The estimate
+        # only chooses a cut point; acceptance still uses the real tokenizer.
         largest = max(range(len(optional)), key=lambda i: len(optional[i][2]))
         index, prefix, source = optional[largest]
-        retained = source[:len(source) // 2]
+        target = min(len(source) // 2, int(len(source) * input_limit / max(tokens, 1)))
+        retained = source[:target]
         optional[largest] = (index, prefix, retained)
         messages[index]['content'] = prefix + retained
         tokens = token_count()

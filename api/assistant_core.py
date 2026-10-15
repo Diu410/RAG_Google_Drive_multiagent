@@ -7,12 +7,15 @@ from contextlib import asynccontextmanager
 
 from assistant_models import AssistantError, AssistantEvent, EventType, TaskStatus, ToolResult
 from assistant_skills import AgentExecutor, SkillRegistry
-from agent_planner import AgentPlan, AgentPlanStep
+from agent_planner import AgentPlan, AgentPlanStep, is_single_information_request
 from model_runtime import get_llm_provider
 from llm_contract import (ProviderError, GenerationCancelled, GenerationScope, current_scope, current_action)
 from pydantic_models import QueryResponse
 from query_router import QueryStrategy, route_by_rules
 from command_intent import requests_file_open, requests_unsupported_file_change, negates_comparison
+from source_grounding import requests_document_library
+from workspace_intent import display_file_target, permits_workspace_operation, references_active_file
+from workspace_router import WorkspaceRoute, WorkspaceRouteDecision
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +53,7 @@ class ExecutionContext:
         token = current_action.set(action.id)
         try:
             yield action
-            if scope and scope.cancelled.is_set():
+            if scope and scope.cancelled.is_set() and self.task.status != TaskStatus.COMPLETED:
                 raise GenerationCancelled()
         except BaseException as exc:
             cancelled = isinstance(exc, asyncio.CancelledError)
@@ -70,9 +73,10 @@ class ExecutionContext:
 
 class AssistantCore:
     def __init__(self, repository, knowledge_skill, save_history, event_sink=None, workspace_skill=None,
-                 history_loader=None, conversation_resolver=None, agent_planner=None):
+                 history_loader=None, conversation_resolver=None, agent_planner=None, response_saver=None):
         self.repository = repository
         self.active_tasks = {}
+        self.deployment_lock = asyncio.Lock()
         self.skills = SkillRegistry()
         self.skills.register(knowledge_skill)
         if workspace_skill:
@@ -80,6 +84,7 @@ class AssistantCore:
         self.workspace_skill = workspace_skill
         self.agent_executor = AgentExecutor(self.skills)
         self.save_history = save_history
+        self.response_saver = response_saver
         self.history_loader = history_loader
         self.conversation_resolver = conversation_resolver
         self.agent_planner = agent_planner
@@ -93,7 +98,7 @@ class AssistantCore:
         """Repair safe, mechanically inferable links without granting new capabilities."""
         compiled = plan.model_copy(deep=True)
         safe_workspace_operations = {
-            'execute', 'find_latest', 'compare_versions', 'open_file', 'list_file_dates',
+            'execute', 'find_latest', 'compare_versions', 'open_file', 'read_file', 'list_file_dates',
         }
         previous_workspace_result = None
         workspace_results = set()
@@ -138,6 +143,13 @@ class AssistantCore:
         entry[1] += 1
         try:
             async with entry[0]:
+                if self.response_saver and request.request_id:
+                    try:
+                        saved = await asyncio.to_thread(self.repository.saved_response, session.id, request)
+                    except ValueError as exc:
+                        raise AssistantError(str(exc), 409) from exc
+                    if saved:
+                        return saved, 0
                 return await self._process_input(request, source=source, on_task_started=on_task_started)
         finally:
             entry[1] -= 1
@@ -146,17 +158,21 @@ class AssistantCore:
 
     async def _process_input(self, request, *, source='text', on_task_started=None):
         started = time.perf_counter()
-        try:
-            session = await asyncio.to_thread(self.repository.ensure_session, request.session_id, request.chat_id)
-        except ValueError as exc:
-            raise AssistantError(str(exc), 409) from exc
-        task = await asyncio.to_thread(self.repository.create_task, session.id, request.question, {'source': source})
-        execution = ExecutionContext(self.repository, task, self.event_sink)
-        await asyncio.to_thread(self.repository.transition, task, TaskStatus.RUNNING)
-        execution.emit(EventType.TASK_STARTED)
-        scope = GenerationScope(task.id)
-        token = current_scope.set(scope)
-        self.active_tasks[task.id] = scope
+        async with self.deployment_lock:
+            try:
+                session = await asyncio.to_thread(self.repository.ensure_session, request.session_id, request.chat_id)
+            except ValueError as exc:
+                raise AssistantError(str(exc), 409) from exc
+            task = await asyncio.to_thread(self.repository.create_task, session.id, request.question, {'source': source})
+            execution = ExecutionContext(self.repository, task, self.event_sink)
+            await asyncio.to_thread(self.repository.transition, task, TaskStatus.RUNNING)
+            execution.emit(EventType.TASK_STARTED)
+            from model_profiles import get_profile
+            scope = GenerationScope(task.id, deadline=time.perf_counter() + get_profile(request.model).request_seconds)
+            token = current_scope.set(scope)
+            from workspace import workspace_scan_cache
+            scan_token = workspace_scan_cache.set({})
+            self.active_tasks[task.id] = scope
         try:
             if on_task_started is not None:
                 on_task_started(task)
@@ -180,6 +196,29 @@ class AssistantCore:
             resume_file_question = None
             confirmed_steps = set()
             pending = await asyncio.to_thread(self.repository.pending_plan, session.id)
+            if request.graph_selection:
+                selection = request.graph_selection
+                if selection.workspace_id != request.workspace_id:
+                    raise AssistantError('Источник вопроса должен совпадать с выбранным графом.', 422)
+                from graph_workbench import graph_workbench
+                async with execution.action('SELECT_GRAPH_SOURCES', {'relation_ids': selection.relation_ids,
+                                                                  'workspace_id': selection.workspace_id}) as action:
+                    workbench = await asyncio.to_thread(graph_workbench, selection.workspace_id,
+                        filesystem=self.workspace_skill.filesystem if self.workspace_skill else None,
+                        connection_factory=self.repository.connection_factory)
+                    inputs['_graph_focus'] = await asyncio.to_thread(workbench.selection, selection.relation_ids)
+                    inputs['_chat_history'] = []
+                    action.output = {'source_count': len(inputs['_graph_focus']['sources'])}
+                # An explicit graph question starts an independent information
+                # request; it must not resume old commands or change sources.
+                await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
+                pending = None
+                precomputed_result = await skill.execute(inputs, execution)
+            if pending:
+                pending_workspace = pending.get('workspace_id') or (pending.get('base_inputs') or {}).get('workspace_id')
+                if pending_workspace and pending_workspace != request.workspace_id:
+                    await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
+                    pending = None
             if pending:
                 reply = request.question.strip().casefold()
                 replacement_command = bool(re.search(
@@ -216,6 +255,8 @@ class AssistantCore:
                         original = pending.get('original_question', '')
                         verb = 'Открой файл' if re.search(r'\bоткрой\w*\b', original, re.I) else 'Прочитай файл'
                         resume_file_question = f'{verb} {selected}'
+                        if requests_file_open(original):
+                            inputs['_workspace_open_authorization'] = original
                         await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
                     elif pending:
                         rendered = '\n'.join(f'{i}. `{item}`' for i, item in enumerate(choices, 1))
@@ -251,10 +292,19 @@ class AssistantCore:
                                 'context': '', 'results': [], 'strategy': 'AGENT_WAITING_FOR_USER',
                                 'plan_status': 'WAITING_FOR_USER', 'pending_step': step,
                             })
-            if self.history_loader:
+            if self.history_loader and not request.graph_selection:
                 history = await asyncio.to_thread(self.history_loader, session.id)
                 inputs['_chat_history'] = history[-6:]
+            direct_workspace_command = bool(not request.graph_selection and self.workspace_skill and request.workspace_id
+                and self.workspace_skill.has_direct_command(request.question))
+            active_file_context = bool(inputs.get('_workspace_active_file') and references_active_file(request.question))
+            named_workspace_query = ''
+            if self.workspace_skill and request.workspace_id and not direct_workspace_command and not request.graph_selection:
+                await asyncio.to_thread(self.workspace_skill.filesystem.sync_index, request.workspace_id)
+                named_workspace_query = await asyncio.to_thread(
+                    self.workspace_skill.named_file_query, request.question, request.workspace_id)
             if (precomputed_result is None and resume_plan is None and resume_file_question is None
+                    and not direct_workspace_command and not named_workspace_query and not active_file_context
                     and history and self.conversation_resolver):
                 try:
                     async with execution.action('CONTEXTUALIZE_QUERY') as action:
@@ -265,16 +315,22 @@ class AssistantCore:
                             request.model.value,
                         )
                         inputs['_retrieval_question'] = resolved.standalone_question
+                        inputs['_depends_on_history'] = resolved.depends_on_history
                         action.output = {'depends_on_history': resolved.depends_on_history}
                 except Exception:
                     logger.warning('Conversation contextualization unavailable; using the original query')
             agent_plan = resume_plan
             planning_text = inputs.get('_retrieval_question', request.question)
-            if self.workspace_skill and request.workspace_id and requests_unsupported_file_change(request.question):
+            if not request.graph_selection and self.workspace_skill and request.workspace_id and requests_unsupported_file_change(request.question):
                 precomputed_result = self.workspace_skill.clarification_result(request.workspace_id, unsupported=True)
             obvious_route = route_by_rules(planning_text)
             if (agent_plan is None and precomputed_result is None and self.agent_planner
                     and resume_file_question is None and not pending
+                    and not (is_single_information_request(request.question)
+                             and is_single_information_request(planning_text))
+                    and not (self.workspace_skill and request.workspace_id
+                             and (direct_workspace_command or named_workspace_query or active_file_context
+                                  or self.workspace_skill.plan(request.question, planning_text)))
                     and not (obvious_route and obvious_route.strategy == QueryStrategy.GENERAL_CHAT)):
                 try:
                     async with execution.action('BUILD_AGENT_PLAN', {'objective': planning_text}) as action:
@@ -289,13 +345,17 @@ class AssistantCore:
                                          'reason': decision.reason}
                     if decision.should_plan and decision.confidence >= 0.65:
                         candidate = self.compile_agent_plan(decision.plan)
-                        if any(step.skill == 'workspace' and (
+                        if any(step.skill == 'workspace' and not permits_workspace_operation(
+                                step.operation, request.question) for step in candidate.steps):
+                            logger.warning('Discarded a plan containing an unrequested workspace operation')
+                        elif any(step.skill == 'workspace' and (
                                 (step.operation == 'open_file' and not requests_file_open(request.question))
                                 or (step.operation == 'compare_versions' and negates_comparison(request.question)))
                                for step in candidate.steps):
                             logger.warning('Discarded a plan that contradicts explicit action intent')
                         elif (self.workspace_skill and request.workspace_id
-                              and not any(step.skill == 'workspace' for step in candidate.steps)):
+                              and any(step.skill == 'knowledge' for step in candidate.steps)
+                              and not requests_document_library(request.question)):
                             # The tool router owns source selection. A planner
                             # cannot silently bypass an active folder; explicit
                             # library requests still route to DOCUMENT_LIBRARY.
@@ -317,12 +377,12 @@ class AssistantCore:
                     and precomputed_result is None):
                 routing_question = inputs.get('_retrieval_question', request.question)
                 workspace_plan = self.workspace_skill.plan(request.question, routing_question)
-                if self.workspace_skill.matches(request.question, routing_question):
+                if named_workspace_query or self.workspace_skill.matches(request.question, routing_question):
                     skill = self.workspace_skill
                     inputs['_workspace_command_question'] = routing_question
                     if workspace_plan:
                         inputs['_workspace_plan'] = workspace_plan.model_dump(mode='json')
-                    if self.workspace_skill.requires_context(routing_question):
+                    if not display_file_target(request.question) and (named_workspace_query or self.workspace_skill.requires_context(routing_question)):
                         budget = await asyncio.to_thread(
                             self.workspace_skill.response_budget, routing_question, request.model.value,
                         )
@@ -347,14 +407,28 @@ class AssistantCore:
                     route = None
                     try:
                         async with execution.action('ROUTE_TOOL', {'question': routing_question}) as action:
-                            route = await asyncio.to_thread(
-                                self.workspace_skill.route_ambiguous,
-                                routing_question,
-                                request.model.value,
-                            )
+                            if (is_single_information_request(request.question)
+                                    and is_single_information_request(routing_question)
+                                    and not requests_document_library(request.question)
+                                    and not (obvious_route and obvious_route.strategy == QueryStrategy.GENERAL_CHAT)):
+                                route = WorkspaceRouteDecision(route=WorkspaceRoute.WORKSPACE_CONTENT,
+                                    confidence=1, reason='Информационный вопрос использует активную папку')
+                            else:
+                                route = await asyncio.to_thread(
+                                    self.workspace_skill.route_ambiguous,
+                                    routing_question,
+                                    request.model.value,
+                                )
                             action.output = route.model_dump(mode='json')
                     except Exception:
                         logger.warning('Workspace tool routing unavailable; using lexical fallback')
+                    if (route and route.route.value == 'DOCUMENT_LIBRARY'
+                            and not requests_document_library(request.question)):
+                        route = None
+                    if route and (not permits_workspace_operation(route.operation, request.question)
+                                  or (route.route.value == 'WORKSPACE_METADATA'
+                                      and not permits_workspace_operation('list_file_dates', request.question))):
+                        route = route.model_copy(update={'route': WorkspaceRoute.WORKSPACE_CONTENT, 'operation': 'answer_question'})
                     if route and (route.operation != 'answer_question' or route.confidence < .65):
                         inputs['_workspace_semantic_decision'] = route.model_dump(mode='json')
                         inputs['_workspace_command_question'] = routing_question
@@ -413,12 +487,13 @@ class AssistantCore:
                     'FIND_LATEST_FILE': 'find_latest',
                     'COMPARE_FILE_VERSIONS': 'compare_versions',
                     'OPEN_FILE': 'open_file',
+                    'READ_FILE': 'read_file',
                     'LIST_FILE_DATES': 'list_file_dates',
                 }
                 agent_steps = []
                 for raw_step in workspace_plan['steps']:
                     arguments = {'target_query': workspace_plan['target_query']}
-                    if raw_step['operation'] == 'OPEN_FILE':
+                    if raw_step['operation'] in {'OPEN_FILE', 'READ_FILE'}:
                         dependency = raw_step.get('depends_on', [])[-1]
                         arguments['path'] = f"${{{dependency}.data.selected_path}}"
                     agent_steps.append(AgentPlanStep(
@@ -452,10 +527,15 @@ class AssistantCore:
                 enhanced=data.get('enhanced', []), results=data.get('results', []),
                 strategy=data.get('strategy'), verification=data.get('verification'), graph=data.get('graph'),
                 plan_status=data.get('plan_status'), pending_step=data.get('pending_step'))
+            response.task_id = task.id
             async with execution.action('SAVE_HISTORY'):
-                await asyncio.to_thread(self.save_history, session.id, request.question, response.answer, request.model.value)
+                if self.response_saver:
+                    await asyncio.to_thread(self.response_saver, request, response, task)
+                else:
+                    await asyncio.to_thread(self.save_history, session.id, request.question, response.answer, request.model.value)
             response.actions = await asyncio.to_thread(self.repository.actions, task.id)
-            await asyncio.to_thread(self.repository.transition, task, TaskStatus.COMPLETED)
+            if task.status != TaskStatus.COMPLETED:
+                await asyncio.to_thread(self.repository.transition, task, TaskStatus.COMPLETED)
             execution.emit(EventType.TASK_COMPLETED)
             response.task_id = task.id
             response.task_status = task.status
@@ -463,14 +543,18 @@ class AssistantCore:
             return response, round((time.perf_counter() - started) * 1000)
         except BaseException as exc:
             cancelled = isinstance(exc, asyncio.CancelledError)
-            await asyncio.to_thread(self.repository.transition, task, TaskStatus.CANCELLED if cancelled else TaskStatus.FAILED,
-                                       error=short_error(exc))
+            if task.status != TaskStatus.COMPLETED:
+                await asyncio.to_thread(self.repository.transition, task, TaskStatus.CANCELLED if cancelled else TaskStatus.FAILED,
+                                           error=short_error(exc))
             execution.emit(EventType.TASK_CANCELLED if cancelled else EventType.TASK_FAILED)
             if isinstance(exc, GenerationCancelled):
                 raise AssistantError("Задача отменена", 409) from exc
             if cancelled or not isinstance(exc, Exception):
                 get_llm_provider().cancel(task.id)
                 raise
+            from file_policy import FilePolicyError
+            if isinstance(exc, FilePolicyError):
+                raise AssistantError(str(exc), 403) from exc
             logger.exception('Assistant task %s failed', task.id)
             if isinstance(exc, AssistantError):
                 raise
@@ -480,3 +564,4 @@ class AssistantCore:
         finally:
             self.active_tasks.pop(task.id, None)
             current_scope.reset(token)
+            workspace_scan_cache.reset(scan_token)

@@ -39,12 +39,13 @@ def insert_application_logs(session_id, user_query, gpt_response, model):
     conn.close()
 
 
-def get_chat_history(session_id):
+def get_chat_history(session_id, limit=3):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('''SELECT user_query, gpt_response FROM application_logs
-                      WHERE session_id = ? AND knowledge_epoch = ? ORDER BY id''',
-                   (session_id, get_knowledge_epoch(conn)))
+    cursor.execute('''SELECT user_query, gpt_response FROM (
+                      SELECT id,user_query,gpt_response FROM application_logs
+                      WHERE session_id = ? AND knowledge_epoch = ? ORDER BY id DESC LIMIT ?)
+                      ORDER BY id''', (session_id, get_knowledge_epoch(conn), max(1, min(limit, 100))))
     messages = []
     for row in cursor.fetchall():
         messages.extend([
@@ -158,3 +159,5 @@ def get_document_source(file_id):
 create_application_logs() #Автоматически создаём таблицу для истории чата
 create_document_store() # Автоматически создаём таблицу для документов
 initialize_knowledge_epoch()
+with closing(get_db_connection()) as _conn, _conn:
+    _conn.execute('CREATE INDEX IF NOT EXISTS application_logs_session_epoch ON application_logs(session_id,knowledge_epoch,id)')

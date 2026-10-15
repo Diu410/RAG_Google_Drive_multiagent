@@ -47,6 +47,7 @@ struct Status {
 
 struct Backend {
     child: Option<Child>,
+    access_token: Option<String>,
     #[cfg(windows)]
     job: Option<Job>,
     status: Status,
@@ -202,6 +203,8 @@ fn launch(app: tauri::AppHandle, shared: Shared) {
                 return;
             }
         };
+        let access_token = uuid::Uuid::new_v4().to_string();
+        cmd.env("KONTUR_API_TOKEN", &access_token);
         cmd.stdout(Stdio::from(log_file))
             .stderr(Stdio::from(stderr))
             .env("KONTUR_DESKTOP", "1");
@@ -237,6 +240,7 @@ fn launch(app: tauri::AppHandle, shared: Shared) {
         {
             let mut backend = shared.lock().unwrap();
             backend.child = Some(child);
+            backend.access_token = Some(access_token);
             #[cfg(windows)]
             {
                 backend.job = Some(job);
@@ -339,9 +343,20 @@ fn launch(app: tauri::AppHandle, shared: Shared) {
     });
 }
 
+#[derive(Serialize)]
+struct StatusResponse {
+    #[serde(flatten)]
+    status: Status,
+    access_token: Option<String>,
+}
+
 #[tauri::command]
-fn backend_status(state: tauri::State<Shared>) -> Status {
-    state.lock().unwrap().status.clone()
+fn backend_status(state: tauri::State<Shared>) -> StatusResponse {
+    let backend = state.lock().unwrap();
+    StatusResponse {
+        status: backend.status.clone(),
+        access_token: if backend.status.state == "ready" { backend.access_token.clone() } else { None },
+    }
 }
 
 #[tauri::command]
@@ -352,6 +367,7 @@ fn retry_backend(app: tauri::AppHandle, state: tauri::State<Shared>) {
         if b.status.state != "error" {
             return;
         }
+        b.access_token = None;
         if let Some(mut child) = b.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -373,6 +389,7 @@ fn retry_backend(app: tauri::AppHandle, state: tauri::State<Shared>) {
 pub fn run() {
     let state: Shared = Arc::new(Mutex::new(Backend {
         child: None,
+        access_token: None,
         #[cfg(windows)]
         job: None,
         status: Status {

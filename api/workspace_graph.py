@@ -38,6 +38,10 @@ class WorkspaceGraphRepository:
                     ON workspace_graph_entities(workspace_id,canonical_name);
                 CREATE INDEX IF NOT EXISTS idx_workspace_graph_file
                     ON workspace_graph_relations(workspace_id,file_key);
+                CREATE INDEX IF NOT EXISTS idx_workspace_graph_source
+                    ON workspace_graph_relations(workspace_id,source_entity_id);
+                CREATE INDEX IF NOT EXISTS idx_workspace_graph_target
+                    ON workspace_graph_relations(workspace_id,target_entity_id);
             """)
 
     @staticmethod

@@ -182,6 +182,21 @@ class GraphService:
             result.entities.insert(0, entity)
         return self._visualization_payload(result, [entity_id], vectorstore, min(limit, MAX_GRAPH_RESULTS))
 
+    def entities_subgraph(self, entity_ids: list[int], depth: int = 1,
+                          limit: int = MAX_GRAPH_RESULTS, vectorstore=None) -> dict:
+        # One bounded traversal for all entities in a response, not N requests.
+        limit = max(1, min(limit, MAX_GRAPH_RESULTS))
+        centers = []
+        for entity_id in dict.fromkeys(entity_ids[:MAX_GRAPH_RESULTS]):
+            entity = self.repository.get_entity(entity_id)
+            if entity is not None:
+                centers.append(entity)
+        ids = [item['id'] for item in centers[:limit]]
+        result = self.traverse(ids, depth, limit)
+        missing = [item for item in centers[:limit] if not any(row['id'] == item['id'] for row in result.entities)]
+        result.entities = missing + result.entities
+        return self._visualization_payload(result, ids, vectorstore, limit)
+
     def document_subgraph(self, document_id: int, limit: int = MAX_GRAPH_RESULTS,
                           vectorstore=None) -> dict | None:
         document = get_document(document_id)

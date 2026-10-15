@@ -21,13 +21,20 @@ class LlamaServerProcess:
         self.state = 'stopped'
         self.error = None
         self._lock = threading.Lock()
+        self._health_lock = threading.Lock()
+        self._health_client = None
         self._stop = threading.Event()
         self._thread = None
         atexit.register(self.stop)
 
     def health(self):
         try:
-            with httpx.Client(timeout=2, trust_env=False) as client:
+            # Reuse the HTTP transport without caching readiness.
+            # Serialize close with probes, including UI polling during a switch.
+            with self._health_lock:
+                if self._health_client is None:
+                    self._health_client = httpx.Client(timeout=2, trust_env=False)
+                client = self._health_client
                 response = client.get(self.url + '/health')
                 if response.status_code == 200:
                     models = client.get(self.url + '/v1/models')
@@ -126,3 +133,18 @@ class LlamaServerProcess:
                     child.kill()
                     child.wait(timeout=5)
             self.state = 'stopped'
+        with self._health_lock:
+            if self._health_client is not None:
+                self._health_client.close()
+                self._health_client = None
+
+    def prepare_replacement(self):
+        if not (self.child and self.child.poll() is None) and self.health()['server_ready']:
+            raise ProviderError('Этот сервер запущен вне приложения. Переключение доступно для управляемой локальной модели.')
+        if not self.autostart:
+            raise ProviderError('Включите локальный автозапуск для переключения моделей.')
+        self.stop()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                raise ProviderError('Предыдущая загрузка ещё завершается. Повторите переключение позже.')

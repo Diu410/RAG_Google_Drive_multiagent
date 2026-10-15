@@ -99,19 +99,10 @@ def load_pdf_ocr(file_path: str):
     return documents
 
 def load_pdf(file_path: str):
-    try:
+    # Completeness failures must propagate; a text-only retry can lose pages.
+    from extraction_limits import extraction_budget
+    with extraction_budget():
         return load_pdf_complete(file_path)
-    except Exception as exc:
-        logger.warning("Structured PDF extraction failed, preserving ordinary text instead: %s", exc)
-        try:
-            from langchain_community.document_loaders import PyMuPDFLoader
-            docs = PyMuPDFLoader(file_path).load()
-            for doc in docs:
-                doc.metadata.update({"block_type": "text", "formula_status": "unavailable"})
-            return docs if any(doc.page_content.strip() for doc in docs) else load_pdf_ocr(file_path)
-        except Exception:
-            logger.exception("PDF text-layer fallback failed; trying confidence-aware OCR")
-            return load_pdf_ocr(file_path)
 
 
 
@@ -121,7 +112,7 @@ def clean_text_refined(text):
 
 
 @serialized_mutation
-def index_document_to_chroma(input_data, file_id):
+def index_document_to_chroma(input_data, file_id, *, commit=None, source_name=None):
     if embedding_model is None or vectorstore is None:
         logger.error("❌ embedding_model или vectorstore не инициализированы — индексация невозможна.")
         return False
@@ -151,7 +142,7 @@ def index_document_to_chroma(input_data, file_id):
 
             logger.info(f"✅ Загружено {len(documents)} страниц из файла.")
             for i, doc in enumerate(documents):
-                logger.info(f"  Стр {i}: {len(doc.page_content)} символов | превью: {doc.page_content[:100]!r}")
+                logger.info('Extracted page %s: characters=%s', i, len(doc.page_content))
 
         elif isinstance(input_data, list):
             documents = input_data
@@ -159,6 +150,8 @@ def index_document_to_chroma(input_data, file_id):
 
         for doc in documents:
             doc.page_content = clean_text_refined(doc.page_content)
+        from extraction_limits import check_extraction_budget
+        check_extraction_budget(sum(len(doc.page_content) for doc in documents))
 
         # Сплиттер
         logger.info("✂️ Разбиваю на чанки...")
@@ -170,7 +163,7 @@ def index_document_to_chroma(input_data, file_id):
         # neither useful to the model nor safe to expose in an answer.
         from db_utils import get_document
         document_record = get_document(file_id)
-        source_name = document_record["filename"] if document_record else f"document-{file_id}"
+        source_name = source_name or (document_record["filename"] if document_record else f"document-{file_id}")
 
         chunk_ids = []
         for index, chunk in enumerate(valid_chunks):
@@ -192,14 +185,14 @@ def index_document_to_chroma(input_data, file_id):
         logger.info(f"🚀 Начинаю индексацию {total} чанков батчами по {BATCH_SIZE}...")
 
         transactions.replace(vectorstore, 'rag_collection', {'file_id': file_id},
-                                    valid_chunks, chunk_ids, batch_size=BATCH_SIZE)
+                                    valid_chunks, chunk_ids, batch_size=BATCH_SIZE, commit=commit)
 
         # Graph extraction is deliberately best-effort. A broken/offline LLM must
         # never invalidate the already completed vector index.
         if document_record:
             try:
                 from graph_extraction import GraphExtractor
-                GraphExtractor().extract_document(valid_chunks, file_id, document_record["filename"])
+                GraphExtractor().extract_document(valid_chunks, file_id, source_name)
             except Exception:
                 logger.exception("Graph extraction unavailable for file_id=%s; keeping normal RAG index", file_id)
 

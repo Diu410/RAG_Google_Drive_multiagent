@@ -56,9 +56,72 @@ GGUF/context/offload; FAST caps output at 1024, BALANCED at 2048, and REASONING
 enables template thinking. Router, verification and graph extraction explicitly
 disable thinking for structured JSON. `LLAMA_PROFILES_FILE` may point to JSON
 overrides keyed by profile name (fields from `ModelProfile`). A profile with a
-different model path/alias/context/offload requires restarting the server with
-that deployment profile (`LLAMA_DEFAULT_PROFILE`); runtime hot swapping is not
-implemented. Unsupported profile names are rejected rather than sent as models.
+different alias/context/offload requires restarting the server with that
+deployment profile (`LLAMA_DEFAULT_PROFILE`). Installed 4B/9B chat weights can
+be selected in the UI; the application restarts its owned chat server when
+switching weights. Unsupported profile names are rejected rather than sent as models.
+
+## Larger local model
+
+The available larger asset is
+[Qwen3.5-9B Q4_K_M](https://huggingface.co/lmstudio-community/Qwen3.5-9B-GGUF/tree/main),
+based on [Qwen's official 9B model](https://huggingface.co/Qwen/Qwen3.5-9B).
+Keep both `api/models/chat.gguf` (4B) and `api/models/Qwen3.5-9B-Q4_K_M.gguf`.
+The chat header has a local-model selector, separate from the response profile.
+Without a saved UI choice, development defaults to 4B. Both files remain on
+disk, while one chat server occupies CPU/GPU memory at a time. A choice persists
+in `KONTUR_DATA_DIR/chat-model-selection.json` and applies to all three profiles.
+Missing assets appear disabled. Switching during an assistant task or active
+inference returns 409; an existing external server is never terminated. After
+a load failure the selector permits choosing the other model.
+
+Additional supported selector IDs are `qwen9b-q3`
+(`models/Qwen3.5-9B-Q3_K_M.gguf`) and `gemma4e4b`
+(`models/gemma-4-E4B_q4_0-it.gguf`). They require separately installed assets.
+The Q3 asset is [Unsloth's quantization of Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/tree/main).
+The E4B asset is [Google's official QAT GGUF](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/tree/main).
+E4B denotes effective inference parameters; its text GGUF is 5.15 GB, not the
+size of an ordinary 4B model. No multimodal projector is needed for document text.
+
+The API adds `POST /api/chat-model` with one of these installed-model IDs.
+`GET /api/model-status` returns `chat_models` and `selected_model_id` alongside
+readiness. Selection writes are atomic; a failed write restores the old
+deployment. A saved UI choice takes precedence over the initial model path.
+
+For structured calls with reasoning disabled, the provider gives the decoder
+an explicit zero thought budget. It enables the reasoning-capable template for
+these JSON calls so llama.cpp can recognise and close spontaneous thought
+channels before applying the JSON grammar. Ordinary text keeps the non-thinking
+template: forcing the reasoning template there can turn subsequent analysis
+into visible prose. Enabled reasoning retains its finite token budget.
+Token counting uses the template selected for the actual request. This behaviour
+was checked with build b11060 and real Gemma 4 E4B requests, including a failed
+audit that previously used 1000 tokens entirely for hidden thoughts.
+
+Measured speed and limits of answer quality are recorded in
+[the local model comparison](local-model-alternatives.md).
+
+For an installation without a saved UI choice, one can also configure
+`LLAMA_MODEL_PATH=models/Qwen3.5-9B-Q4_K_M.gguf` in the active data directory's
+`.env`. Restart the backend to load the new setting. A desktop installation's
+AppData `.env` takes precedence over the development `api/.env`.
+
+The downloaded file is 5,627,044,256 bytes; SHA-256:
+`cd76ec205963b3b33350093e6904d9de16c4e666fd104e1f632d25c7f15f2a13`.
+Pinned GGUF repository revision: `1379f25c6b505a3fc737bd7818cb09389cf807c1`.
+Keep the original 4B at `api/models/chat.gguf`; to return to it, choose 4B in
+the UI selector. Do not replace Nomic embeddings.
+Changing the chat GGUF requires no reindexing.
+
+On the tested RTX 4050 Laptop with 6 GB VRAM and 16 GB RAM, 9B uses partial
+CPU/GPU offload with `LLAMA_GPU_LAYERS=auto` and context 4096. Observed generation
+was approximately 13 tokens/second, compared with approximately 50 for 4B;
+fact answers with routing and verification can take more than two minutes.
+Direct file operations bypass most model calls and remain fast. These are local
+measurements, not throughput guarantees. More parameters do not ensure correct
+tool choice: the original 9B evaluation also exposed routing and verification
+failures. See [the evaluation report](user-query-evaluation.md) for fixes,
+tested scenarios and limitations.
 
 ## Embeddings and existing Chroma
 
@@ -120,7 +183,37 @@ already committed actions, nor a generic interruption mechanism for unrelated
 blocking filesystem/embedding operations. No Live Mode/UI streaming is added.
 
 Each generation records `llm_request_ms` (response-header latency),
+`preparation_ms` (readiness and prompt budgeting), `request_total_ms` (including preparation),
 `time_to_first_token_ms`, `generation_total_ms`, `tokens_per_second`,
-`prompt_tokens`, `completion_tokens`. Token counts come from the server usage;
+`prompt_tokens`, `completion_tokens`, `finish_reason`. Token counts come from the server usage;
 unavailable values on cancelled streams are null, not invented estimates.
 Logs include generation/task/action IDs and timings, not message contents.
+
+Structured output that ends with `finish_reason=length` raises
+`StructuredOutputTruncated`; JSON grammar does not guarantee completion within
+the output budget. The answer verifier checks long answers in bounded parts
+and retries incomplete parts at sentence/line boundaries with a depth limit.
+It never accepts completed claims from an otherwise truncated JSON. See
+[tool-routing.md](tool-routing.md) for the “Тест 4” reproduction and limitations.
+
+Source-scoped workspace overviews enable thinking with a per-request
+`reasoning_budget_tokens` limit. The provider reserves at least 128 output tokens
+after this budget and rejects invalid budgets or a budget with thinking disabled.
+The default request behavior remains unchanged. The overview composer rejects an
+empty or truncated answer. Its verifier uses a smaller reasoning budget and
+constrains generated assessments to the original complete answer sentences;
+changed, duplicated or omitted statements cannot certify the answer.
+This requires the bundled llama-server support for the request field; see
+[the server request conversion](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-common.cpp).
+
+Tokenizer requests can fail while a model loads or the server restarts. The
+provider retries on subsequent counts and caches only successful tokenizer
+results. Conservative UTF-8 byte estimates remain temporary and are never
+cached: an early connection error must not poison the entire backend session.
+Changing chat weights still clears the exact-count cache.
+
+A verification request that cannot retain any sources within its input budget
+returns `UNAVAILABLE`, not `INSUFFICIENT_INFORMATION`. Workspace retains this
+technical cause in the final answer and action journal without repeating
+synthesis or suggesting that the user's question needs clarification. A
+warm-server evaluation alone does not exercise startup recovery.

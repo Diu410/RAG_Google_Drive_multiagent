@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Контур",
+  "productName": "Фортуна",
   "version": "1.0.0",
   "identifier": "local.kontur.rag",
   "build": {
@@ -10,7 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{"label":"main","title":"Контур","width":1280,"height":820,"minWidth":900,"minHeight":620,"center":true,"resizable":true,"maximizable":true,"minimizable":true,"closable":true,"devtools":false}],
+    "windows": [{"label":"main","title":"Фортуна","width":1280,"height":820,"minWidth":900,"minHeight":620,"center":true,"resizable":true,"maximizable":true,"minimizable":true,"closable":true,"devtools":false}],
     "security": {"csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"}
   },
   "bundle": {

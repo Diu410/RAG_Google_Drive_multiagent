@@ -3,8 +3,9 @@
 Live mode is a continuous voice conversation. While it is enabled, the microphone stays
 active, cumulative audio is transcribed approximately every 1.3 seconds, and the partial
 phrase is shown in the conversation. About 1.1 seconds of silence completes the phrase
-and sends it automatically. Model tokens are rendered as they are generated and completed
-phrases are passed to streaming TTS. Listening resumes after playback finishes.
+and sends it automatically. Conversational and library tokens are rendered as they are
+generated and completed phrases are passed to streaming TTS. Workspace answers are streamed
+after their source review, without speaking intermediate drafts. Listening resumes after playback finishes.
 
 ## Use
 
