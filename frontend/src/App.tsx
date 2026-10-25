@@ -35,8 +35,12 @@ import {
 } from "lucide-react";
 import { api, post, streamJsonLines, upload } from "./api";
 import { processAssistantStream, processAssistantLive } from "./assistant";
+import type {WorkspaceSourceScope} from './assistant';
+import {sourceScopeLabel, AnswerSources} from './WorkspaceSources';
+import {WorkspaceIndexDetails, type WorkspaceIndexStatus, type WorkspaceIndexResult} from './WorkspaceIndexDetails';
 import { useChats } from "./useChats";
 import { useModelStatus } from "./useModelStatus";
+import { RepositoryTaskDetails } from "./RepositoryTaskDetails";
 import type { Chat, GraphInfo, Message, Verification } from "./chatTypes";
 const GraphExplorer = lazy(() => import("./GraphExplorer").then(module => ({ default: module.GraphExplorer })));
 import "./router.css";
@@ -48,11 +52,6 @@ type Doc = {
   upload_timestamp: string;
   can_reindex?: boolean;
 };
-type WorkspaceIndexStatus = {
-  readable_documents: number; indexed_documents: number; failed_documents: number;
-  truncated: boolean; scan_errors: number;
-};
-type WorkspaceIndexResult = {indexed: number; unchanged: number; failed: number; unavailable: boolean};
 type Workspace = {
   id: string;
   name: string;
@@ -153,6 +152,11 @@ export default function App() {
   const [workspaceIndexBusy, setWorkspaceIndexBusy] = useState(false);
   const [workspaceIndexStatus, setWorkspaceIndexStatus] = useState<WorkspaceIndexStatus | null>(null);
   const [workspaceIndexMessage, setWorkspaceIndexMessage] = useState('');
+  const [workspaceIndexResult, setWorkspaceIndexResult] = useState<WorkspaceIndexResult | null>(null);
+  const [workspaceIndexRefresh, setWorkspaceIndexRefresh] = useState(0);
+  const [workspaceIndexChecking, setWorkspaceIndexChecking] = useState(false);
+  const [sourceSelection, setSourceSelection] = useState<{workspace_id: string; scope: WorkspaceSourceScope} | null>(null);
+  const workspaceReadRequest = useRef(0);
   const [documentsOpen, setDocumentsOpen] = useState(false),
     [docs, setDocs] = useState<Doc[]>([]),
     [drive, setDrive] = useState(""),
@@ -187,6 +191,11 @@ export default function App() {
     discardRecording = useRef(false),
     partialRequest = useRef(0);
   const chat = chats.find((c) => c.id === active);
+  const sourceScope: WorkspaceSourceScope = sourceSelection && workspace && sourceSelection.workspace_id === workspace.id
+    ? sourceSelection.scope : {kind: 'workspace'};
+  function selectSources(scope: WorkspaceSourceScope) {
+    if (workspace) setSourceSelection({workspace_id: workspace.id, scope});
+  }
   const locked = busy || recording || switchingModel || loadingChat;
   useEffect(() => {
     api<{ configured: boolean; ready: boolean; fallback?: string | null }>(
@@ -219,17 +228,27 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     if (workspaceOpen && workspace && !workspaceIndexBusy) {
-      setWorkspaceIndexStatus(null);
+      setWorkspaceIndexChecking(true);
       api<WorkspaceIndexStatus>(`/workspaces/${encodeURIComponent(workspace.id)}/index-status`)
         .then(status => {if (!disposed) setWorkspaceIndexStatus(status);})
-        .catch(error => {if (!disposed) report(error);});
+        .catch(error => {if (!disposed) {setWorkspaceIndexStatus(null);report(error);}})
+        .finally(() => {if (!disposed) setWorkspaceIndexChecking(false);});
+    } else {
+      setWorkspaceIndexChecking(false);
     }
     return () => {disposed = true;};
-  }, [workspace?.id, workspaceOpen, workspaceIndexBusy]);
+  }, [workspace?.id, workspaceOpen, workspaceIndexBusy, workspaceIndexRefresh]);
   useEffect(() => {
     setWorkspaceIndexStatus(null);
     setWorkspaceIndexMessage('');
+    setWorkspaceIndexResult(null);
   }, [workspace?.id]);
+  useEffect(() => {
+    if (chat?.messages_loaded === false) return;
+    const lastUser = [...(chat?.messages || [])].reverse().find(message => message.role === 'user');
+    setSourceSelection(lastUser?.workspace_id && lastUser.source_scope
+      ? {workspace_id:lastUser.workspace_id,scope:lastUser.source_scope} : null);
+  }, [active, workspace?.id, chat?.messages_loaded]);
   useEffect(() => {
     liveRef.current = live;
     if (live && !recording && !busy && !liveRunning && !recorder.current)
@@ -255,6 +274,7 @@ export default function App() {
     setRetry(null);
     setFiles([]);
     setError("");
+    setSourceSelection(null);
   }
   function stopAudio(invalidate = true) {
     if (invalidate) liveRun.current++;
@@ -349,6 +369,10 @@ export default function App() {
       draft: string;
       edited: string;
       enhanced: string[];
+      task_policy?: Message['task_policy'];
+      context_memory?: Message['context_memory'];
+      results?: Message['results'];
+      source_scope?: WorkspaceSourceScope;
     };
     let partial = "",
       sentence = "",
@@ -383,12 +407,15 @@ export default function App() {
           chat_id: c.id,
           model,
           use_multi_agent: false,
-          workspace_id: workspace?.id,
+           workspace_id: c.messages.at(-1)?.workspace_id,
+           workspace_directory: c.messages.at(-1)?.workspace_directory,
+           source_scope: c.messages.at(-1)?.source_scope,
           live_mode: true,
         },
         (event) => {
           if (event.type === "task" && event.task_id)
             liveTaskId.current = event.task_id;
+          if (event.type === "progress" && event.message) setVoiceState(event.message);
           if (event.type === "stage")
             setVoiceState(
               event.stage === "answering"
@@ -468,6 +495,8 @@ export default function App() {
               strategy: r.strategy,
               verification: r.verification,
               graph: r.graph,
+               task_policy:r.task_policy,context_memory:r.context_memory,
+               results:r.results,source_scope:r.source_scope,
               steps: { draft: r.draft, edited: r.edited, enhanced: r.enhanced },
             },
           ],
@@ -517,14 +546,19 @@ export default function App() {
       liveTaskId.current = null;
       setLiveRunning(true);
       type Result = {answer:string;session_id:string;chat_version?:number;task_id?:string;context:string;
-        strategy?:string;verification?:Verification|null;graph?:GraphInfo|null;draft:string;edited:string;enhanced:string[]};
+        strategy?:string;verification?:Verification|null;graph?:GraphInfo|null;draft:string;edited:string;enhanced:string[];
+        task_policy?:Message['task_policy'];context_memory?:Message['context_memory'];
+        results?:Message['results'];source_scope?:WorkspaceSourceScope};
       let result: Result | undefined;
       await processAssistantStream<Result>({
         question:c.messages.at(-1)!.content,request_id:c.messages.at(-1)?.id,
         session_id:c.session_id,chat_id:c.id,model,use_multi_agent:true,
-        workspace_id:graphSelection ? graphSelection.workspace_id : workspace?.id,graph_selection:graphSelection,
+        workspace_id:graphSelection ? graphSelection.workspace_id : c.messages.at(-1)?.workspace_id,graph_selection:graphSelection,
+        workspace_directory:graphSelection ? undefined : c.messages.at(-1)?.workspace_directory,
+        source_scope:graphSelection ? undefined : c.messages.at(-1)?.source_scope,
       }, event => {
         if (event.type === "task" && event.task_id) {liveTaskId.current = event.task_id;setVoiceState('Готовлю ответ…');}
+        if (event.type === "progress" && event.message) setVoiceState(event.message);
         if (event.type === "result" && event.response) result = event.response;
         if (event.type === "error") throw new Error(event.message || "Не удалось завершить ответ.");
       }, controller.signal);
@@ -533,6 +567,8 @@ export default function App() {
       const next: Chat = {...c,session_id:r.session_id,version:r.chat_version ?? c.version,updated_at:stamp(),messages:[...c.messages,{
         role:"assistant",content:r.answer,timestamp:stamp(),reply_to:c.messages.at(-1)?.id,task_id:r.task_id,
         context:r.context,strategy:r.strategy,verification:r.verification,graph:r.graph,
+         task_policy:r.task_policy,context_memory:r.context_memory,
+         results:r.results,source_scope:r.source_scope,
         steps:{draft:r.draft,edited:r.edited,enhanced:r.enhanced},
       }]};
       accept(await api<Chat>('/chats/' + encodeURIComponent(c.id)).catch(() => next));
@@ -573,7 +609,9 @@ export default function App() {
         updated_at: stamp(),
         messages: [
           ...(chat?.messages || []),
-          { id:crypto.randomUUID(), role: "user", content: text.trim(), timestamp: stamp() },
+          { id:crypto.randomUUID(), role: "user", content: text.trim(), timestamp: stamp(),
+            workspace_id:workspace?.id ?? null, source_scope:workspace ? sourceScope : null,
+            workspace_directory:workspaceListing?.workspace.id === workspace?.id ? workspaceListing?.path : undefined },
         ],
       };
       const saved = await save(c);
@@ -616,6 +654,7 @@ export default function App() {
     }
   }
   async function loadWorkspaceFiles(selected: Workspace, path = "") {
+    const generation = ++workspaceReadRequest.current;
     setWorkspaceBusy(true);
     setError("");
     setWorkspaceFile(null);
@@ -623,31 +662,35 @@ export default function App() {
       const listing = await api<WorkspaceListing>(
         `/workspaces/${encodeURIComponent(selected.id)}/files?path=${encodeURIComponent(path)}`,
       );
-      setWorkspace(selected);
-      setWorkspaceListing(listing);
+      if (generation === workspaceReadRequest.current) {
+        setWorkspace(selected);
+        setWorkspaceListing(listing);
+      }
     } catch (e) {
-      report(e);
+      if (generation === workspaceReadRequest.current) report(e);
     } finally {
-      setWorkspaceBusy(false);
+      if (generation === workspaceReadRequest.current) setWorkspaceBusy(false);
     }
   }
   async function readWorkspaceFile(selected: Workspace, path: string) {
+    const generation = ++workspaceReadRequest.current;
     setWorkspaceBusy(true);
     setError("");
     try {
-      setWorkspaceFile(
-        await api<WorkspaceFile>(
+      const file = await api<WorkspaceFile>(
           `/workspaces/${encodeURIComponent(selected.id)}/file?path=${encodeURIComponent(path)}`,
-        ),
-      );
+        );
+      if (generation === workspaceReadRequest.current) setWorkspaceFile(file);
     } catch (e) {
-      report(e);
+      if (generation === workspaceReadRequest.current) report(e);
     } finally {
-      setWorkspaceBusy(false);
+      if (generation === workspaceReadRequest.current) setWorkspaceBusy(false);
     }
   }
   async function chooseWorkspace() {
+    const generation = ++workspaceReadRequest.current;
     setWorkspaceBusy(true);
+    setWorkspaceFile(null);
     setError("");
     try {
       if (!("__TAURI_INTERNALS__" in window))
@@ -662,6 +705,7 @@ export default function App() {
       const listing = await post<WorkspaceListing>("/workspaces/select", {
         root_path: selected,
       });
+      if (generation !== workspaceReadRequest.current) return;
       setWorkspace(listing.workspace);
       setWorkspaceListing(listing);
       setWorkspaceOpen(true);
@@ -671,20 +715,23 @@ export default function App() {
       setWorkspaceBusy(false);
     }
   }
-  async function indexWorkspace() {
+  async function indexWorkspace(mode: 'update' | 'retry_failed' = 'update') {
     if (!workspace || workspaceIndexBusy) return;
     const selected = workspace;
     setWorkspaceIndexBusy(true);
     setWorkspaceIndexMessage('');
+    setWorkspaceIndexResult(null);
     setError('');
     try {
       const result = await post<WorkspaceIndexResult>(
-        `/workspaces/${encodeURIComponent(selected.id)}/vector-sync?extract_relations=false`, {},
+        `/workspaces/${encodeURIComponent(selected.id)}/vector-sync?extract_relations=false&mode=${mode}`, {},
       );
+      setWorkspaceIndexResult(result);
       setWorkspaceIndexMessage(result.unavailable ? 'Векторный индекс недоступен. Проверьте embedding-модель.' :
-        `Индексация завершена: обновлено ${result.indexed}, без изменений ${result.unchanged}.` +
+        `${mode === 'retry_failed' ? 'Повторная обработка' : 'Индексация'} завершена: обновлено ${result.indexed}, без изменений ${result.unchanged}.` +
+        (result.skipped ? ` Не требовали повтора: ${result.skipped}.` : '') +
         (result.failed ? ` Ошибок: ${result.failed}. Проверьте embedding-модель и журнал backend.` : '') +
-        ' Откройте граф или обновите карту, чтобы увидеть связи.');
+        (result.deleted_chunks ? ` Удалено устаревших фрагментов индекса: ${result.deleted_chunks}.` : ''));
     } catch (error) {report(error);}
     finally {setWorkspaceIndexBusy(false);}
   }
@@ -1076,16 +1123,21 @@ export default function App() {
                 <time>{date(m.timestamp)}</time>
               </div>
               <SafeMarkdown>{m.content}</SafeMarkdown>
+              {m.context_memory && m.context_memory.version>0 && <small>Контекст диалога сжат. Полная история сохранена.</small>}
+              {m.task_policy?.kind==='LONG' && <small>Длительная задача · результаты шагов сохранены в журнале.</small>}
+              {(m.strategy === 'REPOSITORY_AGENT' || m.strategy === 'LOCAL_TOOLS') && m.task_id && <RepositoryTaskDetails taskId={m.task_id}/>}
               {m.role === "assistant" && m.strategy && (
                 <span className="strategy">
-                  {m.strategy.replaceAll("_", " ")}
+                  {m.strategy === 'REPOSITORY_AGENT' ? 'Работа с проектом' : m.strategy.replaceAll("_", " ")}
                 </span>
               )}
               {m.verification && (
                 <div className="verification">
                   <div>
                     <strong>
-                      {m.verification.review_mode === 'CONTEXTUAL'
+                      {m.verification.review_mode === 'CALCULATION'
+                        ? "Вычисление по источнику"
+                        : m.verification.review_mode === 'CONTEXTUAL'
                         ? "Сверка с источниками"
                         : m.strategy === "WORKSPACE_QA"
                         ? "Опора на источники"
@@ -1095,7 +1147,7 @@ export default function App() {
                     </strong>
                     <span>
                         Проверка:{" "}
-                        {m.verification.review_mode === 'CONTEXTUAL' ? ({
+                        {m.verification.review_mode === 'CALCULATION' ? 'исходные метки и расчёт проверены программно' : m.verification.review_mode === 'CONTEXTUAL' ? ({
                           SUPPORTED: 'смысловых замечаний не выявлено',
                           PARTIALLY_SUPPORTED: 'есть интерпретации или неподтверждённые сведения',
                           UNSUPPORTED: 'есть неподтверждённые утверждения',
@@ -1164,12 +1216,7 @@ export default function App() {
                   </details>
                 </div>
               )}
-              {m.context && (
-                <details>
-                  <summary>Источники ответа</summary>
-                  <pre>{m.context}</pre>
-                </details>
-              )}
+              {m.role === 'assistant' && <AnswerSources sources={m.results} context={m.context} />}
               {m.steps?.draft && (
                 <details>
                   <summary>Как создавался ответ</summary>
@@ -1622,7 +1669,7 @@ export default function App() {
                 <Dialog.Title>Workspace</Dialog.Title>
                 <Dialog.Description>
                   {workspace
-                    ? "Активная рабочая папка доступна ассистенту только для чтения."
+                    ? "Выберите источники для ответа. Просмотр файлов не меняет выбранную область. Действия и место сохранения задаются отдельно."
                     : "Выберите папку для текущего рабочего контекста."}
                 </Dialog.Description>
               </div>
@@ -1633,13 +1680,13 @@ export default function App() {
             <div className="workspace-toolbar">
               <button
                 className="primary"
-                disabled={workspaceBusy || workspaceIndexBusy}
+                disabled={workspaceBusy || workspaceIndexBusy || locked || liveRunning}
                 onClick={() => void chooseWorkspace()}
               >
                 <FolderOpen size={16} />
                 {workspace ? "Сменить папку" : "Выбрать папку"}
               </button>
-              {workspace && <button disabled={workspaceBusy || workspaceIndexBusy || locked}
+              {workspace && <button disabled={workspaceBusy || workspaceIndexBusy || locked || liveRunning}
                 onClick={() => void indexWorkspace()}>
                 {workspaceIndexBusy ? 'Индексирую папку…' : 'Индексировать папку'}
               </button>}
@@ -1674,15 +1721,41 @@ export default function App() {
                   "Папка не выбрана"}
               </span>
             </div>
-            {workspace && <p className="workspace-index-status" role="status">
-              {workspaceIndexBusy ? 'Создаю поисковый индекс для файлов и вложенных папок…' :
-                workspaceIndexStatus ? `Проиндексировано ${workspaceIndexStatus.indexed_documents} из ${workspaceIndexStatus.readable_documents} доступных документов.` :
-                  'Проверяю поисковый индекс…'}
-              {!!workspaceIndexStatus?.failed_documents && ` Ошибок индексации: ${workspaceIndexStatus.failed_documents}.`}
-              {workspaceIndexStatus?.truncated && ' Список файлов ограничен; обход папки неполный.'}
-              {!!workspaceIndexStatus?.scan_errors && ' Некоторые файлы или папки недоступны.'}
-            </p>}
+            {workspace && <div className="source-scope-picker">
+              <p><b>Источники ответа:</b> {sourceScopeLabel(sourceScope)}</p>
+              <button type="button" disabled={locked || liveRunning} onClick={() => selectSources({kind:'workspace'})}>
+                Вся рабочая папка
+              </button>
+              {!!workspaceListing?.path && <button type="button" disabled={locked || liveRunning}
+                onClick={() => selectSources({kind:'directory',directory:workspaceListing.path})}>
+                Использовать эту подпапку
+              </button>}
+              {workspaceFile && <>
+                <button type="button" disabled={locked || liveRunning}
+                  onClick={() => selectSources({kind:'files',files:[workspaceFile.path]})}>Только этот файл</button>
+                <button type="button" disabled={locked || liveRunning || sourceScope.kind === 'files' && sourceScope.files.length >= 100}
+                  onClick={() => selectSources({kind:'files', files:[...new Set([
+                    ...(sourceScope.kind === 'files' ? sourceScope.files : []), workspaceFile.path])]})}>
+                  Добавить файл к источникам
+                </button>
+              </>}
+              {sourceScope.kind === 'files' && <ul>{sourceScope.files.map(path => <li key={path}>
+                {path} <button type="button" aria-label={`Исключить ${path}`}
+                  disabled={locked || liveRunning || sourceScope.files.length === 1}
+                  onClick={() => {
+                    const files = sourceScope.files.filter(item => item !== path);
+                    selectSources(files.length ? {kind:'files',files} : {kind:'workspace'});
+                  }}>Убрать</button>
+              </li>)}</ul>}
+            </div>}
+            {workspace && <WorkspaceIndexDetails status={workspaceIndexStatus} result={workspaceIndexResult}
+              busy={workspaceIndexBusy} checking={workspaceIndexChecking} disabled={locked || liveRunning || workspaceBusy}
+              onRefresh={() => setWorkspaceIndexRefresh(value => value + 1)}
+              onRetry={() => void indexWorkspace('retry_failed')} />}
             {workspaceIndexMessage && <p role="status">{workspaceIndexMessage}</p>}
+            {workspace && <p className="workspace-tool-hint">Попросите в чате создать документ по теме,
+              изменить текст или сделать копию в PDF. Для задач с кодом попросите исправление и запуск тестов.
+              Проверки исполняют код выбранного проекта с правами пользователя.</p>}
             {error && <p className="error">{error}</p>}
             {workspaceBusy && <p role="status">Читаю содержимое папки…</p>}
             {workspaceFile ? (

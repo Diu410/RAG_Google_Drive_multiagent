@@ -18,20 +18,28 @@ def is_single_information_request(question: str) -> bool:
     requests and any requested operation keep the existing planner path.
     """
     from command_intent import command_text
-    text = command_text(question).strip()
+    from conversation_context import strip_dialogue_prefix
+    text = strip_dialogue_prefix(command_text(question)).strip()
     text = re.sub(r'^(?:по\s+(?:документам|файлам|источникам)|согласно\s+(?:документам|файлам))\s*[, :]?\s*',
                   '', text, flags=re.I)
     if not re.match(r'^(?:кто|кому|кем|кого|ком|что|чему|чем|чего|каков[аоы]?|какой|какая|какое|какие|какую|каких|'
-                    r'сколько|когда|где|чей|чья|чь[её]|как\s+зовут|'
-                    r'(?:к|ко|с|со|о|об|от|у|для|про|на|за|перед|между|над)\s+'
-                    r'(?:кому|кем|кого|ком|чему|чем|чего|ч[её]м)|'
+                    r'сколько|когда|где|почему|зачем|чей|чья|чь[её]|как\s+зовут|'
+                    r'(?:можно|нужно|верно|разрешен[оаы]?|подтвержден[оаы]?|допускается|требуется|есть)\s+ли|'
+                    r'(?:к|ко|с|со|о|об|от|у|для|про|на|за|перед|между|над|из|при)\s+'
+                    r'(?:кому|кем|кого|ком|чему|чем|чего|ч[её]м|како\w*|каки\w*)|'
                     r'who|what|when|where|how\s+many)\b', text, re.I):
         return False
     if text.count('?') > 1 or re.search(r'\b(?:затем|потом|сначала|после\s+этого|then|afterwards)\b', text, re.I):
         return False
-    return not re.search(r'\b(?:найд\w*|отыщ\w*|поищ\w*|покаж\w*|перечисл\w*|прочит\w*|'
-        r'откро\w*|откры\w*|сравн\w*|удал\w*|переимен\w*|созда\w*|сохран\w*|запиш\w*|'
-        r'состав\w*|сдела\w*|выполн\w*|запуст\w*|постро\w*|find|show|list|read|open|'
+    # Negated device actions and answer-format requests do not request a workflow.
+    # Remove only the bounded phrase itself; an ensuing real action stays visible.
+    text = re.sub(r'\bне\s+(?:запускай|открывай|сохраняй|удаляй)(?:те)?\b', ' ', text)
+    text = re.sub(r'\bсохрани(?:те)?\s+(?:(?:все|важные|исходные|невыполненн\w*|существенные?)\s+)?'
+                  r'(?:услови\w*|отрицани\w*|модальност\w*|смысл)\b(?=\s*(?:$|[.!?,;]))', ' ', text)
+    text = re.sub(r'\bпокажи(?:те)?\s+(?:(?:короткий|краткий)\s+)?(?:расч[её]т|обоснование|формулу|вывод)\b(?=\s*(?:$|[.!?,;]))', ' ', text)
+    return not re.search(r'\b(?:найди(?:те)?|отыщи(?:те)?|поищи(?:те)?|покажи(?:те)?|перечисли(?:те)?|прочитай(?:те)?|прочти(?:те)?|'
+        r'открой(?:те)?|открывай(?:те)?|сравни(?:те)?|удали(?:те)?|переименуй(?:те)?|создай(?:те)?|сохрани(?:те)?|запиши(?:те)?|'
+        r'составь(?:те)?|сделай(?:те)?|выполни(?:те)?|выполняй(?:те)?|запусти(?:те)?|запускай(?:те)?|построй(?:те)?|find|show|list|read|open|'
         r'compare|delete|rename|create|save|write|run|execute)\b', text, re.I)
 
 

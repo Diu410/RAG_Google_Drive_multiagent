@@ -15,7 +15,7 @@ import time
 import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
-RUN = ROOT / '.user-evaluation' / time.strftime('%Y%m%d-%H%M%S')
+RUN = Path(os.environ['EVALUATION_RUN_DIR']) if os.getenv('EVALUATION_RUN_DIR') else ROOT / '.user-evaluation' / time.strftime('%Y%m%d-%H%M%S')
 RUN.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(ROOT / 'api'))
 
@@ -26,11 +26,11 @@ def available_port():
 
 for key, value in {
     'KONTUR_DATA_DIR': str(RUN), 'RAG_DB_PATH': str(RUN / 'evaluation.db'),
-    'CHROMA_PATH': str(RUN / 'chroma'), 'LLAMA_AUTOSTART': 'true',
+    'CHROMA_PATH': str(RUN / 'chroma'), 'LLAMA_AUTOSTART': 'false' if os.getenv('EVALUATION_CHAT_SERVER_URL') else 'true',
     'LLAMA_MODEL_PATH': os.getenv('EVALUATION_MODEL_PATH', str(ROOT / 'api/models/chat.gguf')),
     'EMBEDDING_MODEL_PATH': str(ROOT / 'api/models/nomic-embed-text.gguf'),
-    'LLAMA_SERVER_URL': f'http://127.0.0.1:{available_port()}',
-    'EMBEDDING_SERVER_URL': f'http://127.0.0.1:{available_port()}',
+    'LLAMA_SERVER_URL': os.getenv('EVALUATION_CHAT_SERVER_URL') or f'http://127.0.0.1:{available_port()}',
+    'EMBEDDING_SERVER_URL': os.getenv('EVALUATION_EMBEDDING_SERVER_URL') or f'http://127.0.0.1:{available_port()}',
     'LLAMA_REQUEST_TIMEOUT': '90', 'VERIFIER_ENABLED': 'true',
     'ANONYMIZED_TELEMETRY': 'False',
 }.items():

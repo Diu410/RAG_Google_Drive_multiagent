@@ -149,6 +149,10 @@ def delete_chat(chat_id: str):
                 conn.execute('DELETE FROM assistant_tasks WHERE session_id=?', (session_id,))
             if 'assistant_pending_plans' in tables:
                 conn.execute('DELETE FROM assistant_pending_plans WHERE session_id=?', (session_id,))
+            for table in ('assistant_context_checkpoints','assistant_context_origins'):
+                if table in tables:conn.execute(f'DELETE FROM {table} WHERE session_id=?',(session_id,))
+            if 'assistant_history_scopes' in tables:
+                conn.execute('DELETE FROM assistant_history_scopes WHERE log_id IN (SELECT id FROM application_logs WHERE session_id=?)',(session_id,))
             conn.execute('DELETE FROM application_logs WHERE session_id=?', (session_id,))
             if 'assistant_sessions' in tables:
                 conn.execute('DELETE FROM assistant_sessions WHERE id=?', (session_id,))

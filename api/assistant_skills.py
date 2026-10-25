@@ -109,7 +109,7 @@ class AgentExecutor:
                 })
             arguments = dict(shared)
             step_arguments = {key: value for key, value in self._resolve(step.arguments, results).items()
-                              if not key.startswith('_') and key not in {'session_id', 'chat_id', 'workspace_id'}}
+                              if not key.startswith('_') and key not in {'session_id', 'chat_id', 'workspace_id', 'source_scope'}}
             if step_arguments.get('question') and step_arguments['question'] != shared.get('question'):
                 # Routing and retrieval were derived from the whole objective.
                 # They must not override a different, explicit step subtask.

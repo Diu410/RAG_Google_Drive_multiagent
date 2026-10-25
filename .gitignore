@@ -78,6 +78,8 @@ frontend/src-tauri/gen/
 
 # Training output can contain private data when users extend the starter set.
 /.training-output/
+.fortuna-backups/
+.fortuna-*.tmp
 /training/outputs/
 /training/checkpoints/
 /training/private/

@@ -15,6 +15,27 @@ _DIRECTORY_TARGET = re.compile(r'^(?:папк|директор|workspace|вор�
 _PRONOUN_TARGET = re.compile(r'^(?:эт\w*|текущ\w*|данн\w*|нем|нём|ней|его|е[её]|it|this|that)\b', re.I)
 
 
+def _literal_target(match, text):
+    target = match.group(1).strip().rstrip('?!.').strip(' "\'«»`“”')
+    if re.fullmatch(r'md|markdown|txt|pdf|docx|html?|csv|tsv|json',target,re.I):
+        label=re.search(r'((?:файл|документ|заметк)\w*)\s+$',text[:match.start(1)],re.I)
+        if label:target=label[1]+' '+target
+    return target
+
+
+def references_created_file(text: str) -> bool:
+    return bool(re.search(r'\b(?:созданн\w*|сохран[её]нн\w*|подготовленн\w*|сконвертированн\w*)\s+'
+        r'(?:(?:тобой|вами)\s+)?(?:файл|документ|заметк|копи)\w*\b|'
+        r'\b(?:файл|документ|заметк|копи)\w*\s*,?\s+котор\w*\s+(?:ты|вы)\s+'
+        r'(?:создал\w*|сохранил\w*|подготовил\w*)\b',command_text(text),re.I))
+
+
+def asks_last_opened_file(text: str) -> bool:
+    return bool(re.fullmatch(r'(?:а\s+)?(?:(?:ты|вы)\s+(?:что|ч[её])|'
+        r'(?:что|ч[её]|какой\s+(?:файл|документ))\s+(?:ты|вы))\s+'
+        r'(?:(?:вообще|именно|сейчас|только\s+что)\s+)?открыл[аи]?\s*[?!.]*',command_text(text).strip(),re.I))
+
+
 def display_file_target(text: str) -> str:
     """Return a literal file description; folder requests and pronouns stay separate."""
     commands = command_text(text)
@@ -24,8 +45,10 @@ def display_file_target(text: str) -> str:
     match = match or _INSIDE.search(text)
     if not match:
         return ''
-    target = match.group(1).strip().rstrip('?!.').strip(' "\'«»`“”')
-    if (not target or _DIRECTORY_TARGET.search(target) or _PRONOUN_TARGET.search(target)
+    target = _literal_target(match,text)
+    literal = bool(re.search(r'\.\w{1,10}$',target))
+    if (not target or _DIRECTORY_TARGET.search(target) or (not literal and (
+            _PRONOUN_TARGET.search(target) or references_created_file(target)))
             or re.match(r'^(?:о|об|про|about)\b', target, re.I)):
         return ''
     return target
@@ -37,8 +60,10 @@ def open_file_target(text: str) -> str:
     match = re.search(r'\b(?:открой(?:те)?|открывай(?:те)?|открыть|open)\s+(?:файл\w*\s+)?(.+?)\s*[?!]*$', text, re.I)
     if not match:
         return ''
-    target = match.group(1).strip().rstrip('?!.').strip(' "\'«»`“”')
-    if _DIRECTORY_TARGET.search(target) or _PRONOUN_TARGET.search(target):
+    target = _literal_target(match,text)
+    literal = bool(re.search(r'\.\w{1,10}$',target))
+    if _DIRECTORY_TARGET.search(target) or (not literal and (
+            _PRONOUN_TARGET.search(target) or references_created_file(target))):
         return ''
     return target
 
@@ -49,7 +74,15 @@ def is_contents_question(text: str) -> bool:
 
 def references_active_file(text: str) -> bool:
     return bool(re.search(r'\b(?:эт(?:от|ого|ом|ой|у|а|о)|тот|данн\w*)\s+(?:файл|заметк|документ)\w*\b|'
-                          r'\b(?:его|е[её])\s+(?:содержим|текст)\w*\b', command_text(text)))
+                          r'\b(?:его|е[её])\s+(?:содержим|текст)\w*\b|'
+                          r'\b(?:открой(?:те)?|прочитай(?:те)?|прочти(?:те)?|покажи(?:те)?|open|read|show)\s+'
+                          r'(?:его|е[её]|it)\b', command_text(text))) or references_created_file(text)
+
+
+def requests_active_file_read(text: str) -> bool:
+    commands = command_text(text)
+    return references_active_file(text) and bool(re.search(
+        r'(?<!не )\b(?:прочитай|прочти|покажи|read|show)\b',commands))
 
 
 def permits_workspace_operation(operation: str, original: str) -> bool:

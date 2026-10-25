@@ -7,6 +7,7 @@ import argparse
 import asyncio
 from collections import defaultdict
 from dataclasses import asdict
+from datetime import datetime
 import hashlib
 import json
 import logging
@@ -27,17 +28,21 @@ async def benchmark(args):
     from evidence_audit import EvidenceAuditor
     from model_profiles import get_profile
     from pydantic_models import QueryInput, VerificationClaim
+    from llm_contract import current_action
     from verifier import Verifier
     main, run = harness.main, harness.RUN
     code_hashes = {name: hashlib.sha256((harness.ROOT / 'api' / name).read_bytes()).hexdigest()
                    for name in ('assistant_core.py', 'agent_planner.py', 'workspace.py', 'response_budget.py',
                                 'evidence_audit.py', 'verifier.py', 'llama_process.py', 'llama_provider.py',
-                                'graph_extraction.py')}
+                                'graph_extraction.py', 'answer_editing.py')}
     logging.getLogger().setLevel(logging.ERROR)
     provider, embeddings = harness.get_llm_provider(), harness.get_embedding_provider()
     calls, records = [], []
     original_stream = provider.stream
     original_batch = settings.EVIDENCE_AUDIT_BATCH_SIZE
+    original_compact = settings.EVIDENCE_AUDIT_COMPACT
+    if args.audit_format in ('legacy', 'compact'):
+        settings.EVIDENCE_AUDIT_COMPACT = args.audit_format == 'compact'
     protected = [harness.ROOT / 'api' / name for name in ('rag_app.db', 'chat-model-selection.json')]
     digests = {path: hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
                for path in protected}
@@ -48,9 +53,13 @@ async def benchmark(args):
         props = schema.get('properties', {})
         stage = schema.get('title') or ','.join(props) or 'text_generation'
         row = {'stage': stage, 'profile': options.get('profile'), 'thinking': options.get('thinking'),
-               'max_tokens': options.get('max_tokens')}
+               'max_tokens': options.get('max_tokens'), 'action_id': current_action.get(),
+               'input_characters': sum(len(message.get('content', '')) for message in messages),
+               'text_characters': 0, 'reasoning_characters': 0}
         try:
             for delta in original_stream(messages, **options):
+                row['text_characters'] += len(delta.text)
+                row['reasoning_characters'] += len(delta.reasoning)
                 if delta.metrics:
                     row.update(asdict(delta.metrics))
                 yield delta
@@ -66,16 +75,29 @@ async def benchmark(args):
     async def measure(label, operation, batch, profile, repeat):
         settings.EVIDENCE_AUDIT_BATCH_SIZE = batch
         start_call, started = len(calls), time.perf_counter()
-        row = {'id': label, 'batch_size': batch, 'profile': profile, 'repeat': repeat}
+        row = {'id': label, 'batch_size': batch, 'profile': profile, 'repeat': repeat,
+               'audit_format': 'compact' if settings.EVIDENCE_AUDIT_COMPACT else 'legacy'}
         try:
             row.update(await operation())
         except Exception as error:
             row.update(passed=False, error=f'{type(error).__name__}: {error}')
         row.update(seconds=time.perf_counter() - started, calls=calls[start_call:])
+        actions = (row.get('response') or {}).get('actions', [])
+        row['action_times'] = [{'action': action['action_type'], 'status': action['status'],
+            'seconds': (datetime.fromisoformat(action['completed_at']) -
+                        datetime.fromisoformat(action['started_at'])).total_seconds()}
+            for action in actions if action.get('started_at') and action.get('completed_at')]
+        if actions:
+            row['outside_actions_seconds'] = max(0, row['seconds'] - sum(a['seconds'] for a in row['action_times']))
+        action_names = {action['id']: action['action_type'] for action in actions}
+        for call in row['calls']:
+            call['action'] = action_names.get(call['action_id'])
         records.append(row)
         (run / 'benchmark.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
         print(f"{label} {profile} batch={batch} repeat={repeat}: "
               f"{'PASS' if row['passed'] else 'FAIL'} {row['seconds']:.2f}s, {len(row['calls'])} LLM calls", flush=True)
+        if row['action_times']:
+            print('  ' + ', '.join(f"{a['action']}={a['seconds']:.2f}s" for a in row['action_times']), flush=True)
 
     try:
         print(f'Output: {run}', flush=True)
@@ -105,7 +127,11 @@ async def benchmark(args):
                             actual = [supported for supported, _ in outcomes]
                             return {'passed': actual == expected, 'actual': actual, 'expected': expected,
                                     'assessments': [auditor.last_assessment.model_dump() for _, auditor in outcomes]}
-                        await measure(label, audit, batch, 'FAST', repeat)
+                        formats = (('legacy', 'compact') if repeat % 2 else ('compact', 'legacy')) if args.audit_format == 'both' else (args.audit_format,)
+                        for wire_format in formats:
+                            if wire_format:
+                                settings.EVIDENCE_AUDIT_COMPACT = wire_format == 'compact'
+                            await measure(label, audit, batch, 'FAST', repeat)
 
         if args.phase in ('all', 'overview'):
             from overview_facts import CheckedFact, FactFirstOverview
@@ -146,19 +172,24 @@ async def benchmark(args):
                      (args.case or ('fact', 'physical-fact', 'source-injection'))]
             for repeat in range(1, args.repeats + 1):
                 for label, question, required, forbidden, _ in cases:
-                    for batch in ((1, 2) if repeat % 2 else (2, 1)):
+                    for batch in ([args.batch_size] if args.batch_size else ((1, 2) if repeat % 2 else (2, 1))):
                         async def request(question=question, required=required, forbidden=forbidden, label=label):
                             response, _ = await main.assistant_core.process_input(QueryInput(
-                                question=question, model='FAST', workspace_id=workspace.id))
+                                question=question, model=args.profile, workspace_id=workspace.id,
+                                use_multi_agent=args.use_multi_agent))
                             checks = {f'contains:{word}': word.casefold() in response.answer.casefold() for word in required}
                             checks.update({f'excludes:{word}': word.casefold() not in response.answer.casefold() for word in forbidden})
                             checks['completed'] = response.task_status.value == 'COMPLETED'
+                            check = response.verification
+                            checks['review_completed'] = bool(check and check.status != 'UNAVAILABLE')
+                            if label in ('fact', 'physical-fact'):
+                                checks['facts_supported'] = bool(check and check.status == 'SUPPORTED')
                             if label in ('unavailable-fact', 'mixed-known-missing'):
                                 checks['admits_missing_fact'] = any(word in response.answer.casefold() for word in
                                     ('не указан', 'нет информац', 'недостаточно', 'не содерж', 'не найден', 'не предостав'))
                             return {'passed': all(checks.values()), 'checks': checks,
                                     'response': response.model_dump(mode='json')}
-                        await measure(label, request, batch, 'FAST', repeat)
+                        await measure(label, request, batch, args.profile, repeat)
             assert before == {str(p.relative_to(root)): p.read_bytes() for p in root.rglob('*') if p.is_file()}
         if args.phase in ('all', 'graph'):
             from chroma_utils import vectorstore, retriever
@@ -207,10 +238,11 @@ async def benchmark(args):
                 await measure('graph-retrieval', graph_retrieve, original_batch, 'FAST', repeat)
         groups = defaultdict(list)
         for row in records:
-            groups[f"{row['id']}:{row['profile']}:batch{row['batch_size']}"].append(row)
+            groups[f"{row['id']}:{row['profile']}:batch{row['batch_size']}:{row['audit_format']}"].append(row)
         summary = {'model': str(get_profile().model_path), 'startup_seconds': startup,
                    'code_hashes': code_hashes,
-                   'configuration': asdict(get_profile()), 'repeats': args.repeats,
+                   'configuration': asdict(get_profile(args.profile)), 'repeats': args.repeats,
+                   'request_profile': args.profile, 'use_multi_agent': args.use_multi_agent,
                    'passed': sum(r['passed'] for r in records), 'total': len(records),
                    'groups': {key: {'median_seconds': statistics.median(r['seconds'] for r in rows),
                                     'samples': len(rows), 'passed': sum(r['passed'] for r in rows),
@@ -225,6 +257,7 @@ async def benchmark(args):
         return summary['passed'] == summary['total'] and summary['protected_files_unchanged']
     finally:
         settings.EVIDENCE_AUDIT_BATCH_SIZE = original_batch
+        settings.EVIDENCE_AUDIT_COMPACT = original_compact
         provider.stream = original_stream
         try:
             provider.close()
@@ -244,9 +277,19 @@ if __name__ == '__main__':
     parser.add_argument('--model', help='Absolute GGUF path; working configuration is unchanged')
     parser.add_argument('--phase', choices=('all', 'audit', 'requests', 'graph', 'overview'), default='all')
     parser.add_argument('--repeats', type=int, default=2)
+    parser.add_argument('--profile', choices=('FAST', 'BALANCED', 'REASONING'), default='FAST',
+                        help='Inference profile for request samples')
+    parser.add_argument('--use-multi-agent', action='store_true',
+                        help='Include the automatic editing used by the ordinary chat UI')
+    parser.add_argument('--batch-size', type=int, choices=(1, 2),
+                        help='Measure one audit batch size instead of the alternating comparison')
+    parser.add_argument('--audit-format', choices=('legacy', 'compact', 'both'),
+                        help='Select transport; both interleaves formats in the audit phase')
     parser.add_argument('--case', action='append', choices=('fact', 'physical-fact', 'source-injection',
                         'unavailable-fact', 'mixed-known-missing'), help='Select request scenarios')
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error('--repeats must be positive')
+    if args.audit_format == 'both' and args.phase != 'audit':
+        parser.error('--audit-format both requires --phase audit')
     sys.exit(0 if asyncio.run(benchmark(args)) else 1)

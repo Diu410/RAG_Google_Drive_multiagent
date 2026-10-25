@@ -55,6 +55,35 @@ def get_chat_history(session_id, limit=3):
     conn.close()
     return messages
 
+
+def get_chat_archive(session_id, after=0, limit=128, *, scope_key='LIBRARY', include_legacy=True,
+                     epoch=None, terms=None, newest=False):
+    """Paged original messages; compaction never replaces application_logs."""
+    with closing(get_db_connection()) as conn:
+        epoch=get_knowledge_epoch(conn) if epoch is None else epoch
+        clause=''
+        arguments=[session_id,after//2+int(after%2==1),scope_key,int(include_legacy)]
+        if terms:
+            variants=list(dict.fromkeys(v for term in terms[:8] for v in (term,term.capitalize(),term.upper())))
+            clause=' AND ('+' OR '.join('(l.user_query LIKE ? ESCAPE \'\\\' OR l.gpt_response LIKE ? ESCAPE \'\\\')' for _ in variants)+')'
+            for term in variants:
+                value='%'+term.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+                arguments.extend([value,value])
+        rows=conn.execute('SELECT l.id,l.user_query,l.gpt_response,l.knowledge_epoch FROM application_logs l '
+            'LEFT JOIN assistant_history_scopes s ON s.log_id=l.id '
+            'WHERE l.session_id=? AND l.id>=? '
+            'AND (s.scope_key=? OR (s.log_id IS NULL AND ?))'+clause+
+            (' ORDER BY l.id DESC' if terms or newest else ' ORDER BY l.id')+' LIMIT ?',
+            (*arguments,max(1,min(limit,256)))).fetchall()
+        messages=[]
+        for row in rows:
+            for offset,(role,text) in enumerate((('user',row['user_query']),('assistant',row['gpt_response']))):
+                if role=='assistant' and row['knowledge_epoch']!=epoch:continue
+                position=row['id']*2+offset
+                if position>after and text:
+                    messages.append({'id':str(position),'position':position,'role':role,'content':text})
+        return sorted(messages,key=lambda m:m['position'])
+
 def create_document_store():
     # Тут мы создаём таблицу где будут хранится информация про файлы.
     conn = get_db_connection()

@@ -20,6 +20,7 @@ Get-ChildItem -LiteralPath $llamaSource -File | Where-Object { $_.Extension -eq 
 $legacyMarker = Join-Path $resources 'legacy-data-location.txt'
 [System.IO.File]::WriteAllText($legacyMarker, (Join-Path $root 'api'), [System.Text.UTF8Encoding]::new($false))
 $arguments = @('-m','PyInstaller','--noconfirm','--onefile','--exclude-module','ollama','--exclude-module','langchain_ollama','--name','kontur-backend','--paths',(Join-Path $root 'api'),'--collect-all','chromadb','--hidden-import','whisper_utils','--distpath',$out,'--workpath',(Join-Path $root 'build\pyinstaller'),'--specpath',(Join-Path $root 'build'))
+$arguments += @('--add-data', ((Join-Path $root 'api\agent_skills') + ':agent_skills'))
 $arguments += (Join-Path $root 'frontend\scripts\backend_entry.py')
 & $python @arguments
 if ($LASTEXITCODE -ne 0) { throw 'Backend sidecar build failed' }

@@ -1,4 +1,5 @@
 import type {GraphSelection} from './graphTypes';
+import type {WorkspaceSourceScope} from './assistant';
 
 export type SearchResult = {
   document_id: number | string | null;
@@ -55,6 +56,8 @@ export type Message = {
   id?: string;
   reply_to?: string | null;
   task_id?: string;
+  task_policy?: {kind:string;seconds:number;reason:string} | null;
+  context_memory?: {version:number;compacted:boolean;archive_preserved:boolean} | null;
   role: "user" | "assistant";
   content: string;
   timestamp: string;
@@ -63,6 +66,10 @@ export type Message = {
   verification?: Verification | null;
   graph?: GraphInfo | null;
   graphSelection?: GraphSelection;
+  workspace_id?: string | null;
+  workspace_directory?: string;
+  source_scope?: WorkspaceSourceScope | null;
+  results?: SearchResult[];
   steps?: { draft?: string; edited?: string; enhanced?: string[] };
 };
 export type Chat = {

@@ -3,19 +3,23 @@ import asyncio
 import logging
 import re
 import time
+from pathlib import PurePosixPath
 from contextlib import asynccontextmanager
 
 from assistant_models import AssistantError, AssistantEvent, EventType, TaskStatus, ToolResult
 from assistant_skills import AgentExecutor, SkillRegistry
 from agent_planner import AgentPlan, AgentPlanStep, is_single_information_request
 from model_runtime import get_llm_provider
-from llm_contract import (ProviderError, GenerationCancelled, GenerationScope, current_scope, current_action)
+from llm_contract import (ProviderError, GenerationCancelled, GenerationDeadlineExceeded, GenerationScope, current_scope, current_action)
 from pydantic_models import QueryResponse
 from query_router import QueryStrategy, route_by_rules
 from command_intent import requests_file_open, requests_unsupported_file_change, negates_comparison
 from source_grounding import requests_document_library
-from workspace_intent import display_file_target, permits_workspace_operation, references_active_file
+from workspace_intent import (display_file_target, open_file_target, permits_workspace_operation,
+                              references_active_file, references_created_file, asks_last_opened_file,
+                              requests_active_file_read)
 from workspace_router import WorkspaceRoute, WorkspaceRouteDecision
+from workspace_source_scope import WorkspaceSourceScope
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +31,19 @@ def short_error(exc):
 
 
 class ExecutionContext:
-    def __init__(self, repository, task, event_sink=None):
+    def __init__(self, repository, task, event_sink=None, progress_sink=None):
         self.repository, self.task = repository, task
         self.event_sink = event_sink
         self.events = []
+        self.progress_sink=progress_sink
+
+    def progress(self, message):
+        if self.progress_sink:self.progress_sink(message)
+
+    async def configure_policy(self, policy):
+        from task_policy import apply_policy
+        apply_policy(current_scope.get(),policy)
+        await asyncio.to_thread(self.repository.update_task_metadata,self.task,execution_policy=policy.as_dict())
 
     def emit(self, kind, action_id=None):
         event = AssistantEvent(type=kind, task_id=self.task.id,
@@ -53,7 +66,10 @@ class ExecutionContext:
         token = current_action.set(action.id)
         try:
             yield action
-            if scope and scope.cancelled.is_set() and self.task.status != TaskStatus.COMPLETED:
+            committed_write = (action.action_type in {'APPLY_DOCUMENT_CHANGE', 'REPOSITORY_EDIT',
+                'REPOSITORY_REWRITE', 'REPOSITORY_WRITE'} and action.output.get('applied') is True)
+            if (scope and scope.cancelled.is_set() and self.task.status != TaskStatus.COMPLETED
+                    and not committed_write):
                 raise GenerationCancelled()
         except BaseException as exc:
             cancelled = isinstance(exc, asyncio.CancelledError)
@@ -73,7 +89,8 @@ class ExecutionContext:
 
 class AssistantCore:
     def __init__(self, repository, knowledge_skill, save_history, event_sink=None, workspace_skill=None,
-                 history_loader=None, conversation_resolver=None, agent_planner=None, response_saver=None):
+                 history_loader=None, conversation_resolver=None, agent_planner=None, response_saver=None,
+                 local_tools_skill=None, repository_agent_skill=None, conversation_memory=None):
         self.repository = repository
         self.active_tasks = {}
         self.deployment_lock = asyncio.Lock()
@@ -82,10 +99,18 @@ class AssistantCore:
         if workspace_skill:
             self.skills.register(workspace_skill)
         self.workspace_skill = workspace_skill
+        self.local_tools_skill = local_tools_skill
+        if local_tools_skill:
+            self.skills.register(local_tools_skill)
+            local_tools_skill.workspace_skill = workspace_skill
+        self.repository_agent_skill = repository_agent_skill
+        if repository_agent_skill:
+            self.skills.register(repository_agent_skill)
         self.agent_executor = AgentExecutor(self.skills)
         self.save_history = save_history
         self.response_saver = response_saver
         self.history_loader = history_loader
+        self.conversation_memory=conversation_memory
         self.conversation_resolver = conversation_resolver
         self.agent_planner = agent_planner
         self.event_sink = event_sink
@@ -132,7 +157,7 @@ class AssistantCore:
         get_llm_provider().cancel(task_id)
         return True
 
-    async def process_input(self, request, *, source='text', on_task_started=None):
+    async def process_input(self, request, *, source='text', on_task_started=None, on_progress=None):
         try:
             session = await asyncio.to_thread(self.repository.ensure_session, request.session_id, request.chat_id)
         except ValueError as exc:
@@ -150,13 +175,13 @@ class AssistantCore:
                         raise AssistantError(str(exc), 409) from exc
                     if saved:
                         return saved, 0
-                return await self._process_input(request, source=source, on_task_started=on_task_started)
+                return await self._process_input(request, source=source, on_task_started=on_task_started,on_progress=on_progress)
         finally:
             entry[1] -= 1
             if not entry[1]:
                 self._session_locks.pop(key, None)
 
-    async def _process_input(self, request, *, source='text', on_task_started=None):
+    async def _process_input(self, request, *, source='text', on_task_started=None, on_progress=None):
         started = time.perf_counter()
         async with self.deployment_lock:
             try:
@@ -164,11 +189,15 @@ class AssistantCore:
             except ValueError as exc:
                 raise AssistantError(str(exc), 409) from exc
             task = await asyncio.to_thread(self.repository.create_task, session.id, request.question, {'source': source})
-            execution = ExecutionContext(self.repository, task, self.event_sink)
+            execution = ExecutionContext(self.repository, task, self.event_sink,on_progress)
             await asyncio.to_thread(self.repository.transition, task, TaskStatus.RUNNING)
             execution.emit(EventType.TASK_STARTED)
             from model_profiles import get_profile
             scope = GenerationScope(task.id, deadline=time.perf_counter() + get_profile(request.model).request_seconds)
+            from task_policy import classify_task,apply_policy
+            policy=classify_task(request.question,request.model,bool(request.workspace_id))
+            apply_policy(scope,policy)
+            await asyncio.to_thread(self.repository.update_task_metadata,task,execution_policy=policy.as_dict())
             token = current_scope.set(scope)
             from workspace import workspace_scan_cache
             scan_token = workspace_scan_cache.set({})
@@ -176,7 +205,11 @@ class AssistantCore:
         try:
             if on_task_started is not None:
                 on_task_started(task)
+            if policy.kind=='LONG':execution.progress('Длительная задача: выполняю по шагам, сохраняю результаты и проверки.')
             inputs = request.model_dump()
+            # Pending state is JSON-persisted. Keep the immutable selection's
+            # tuple/list representation identical across confirmation turns.
+            inputs['source_scope'] = request.source_scope.model_dump(mode='json') if request.source_scope else None
             if request.workspace_id and self.workspace_skill:
                 current_directory = await asyncio.to_thread(self.workspace_skill.repository.session_directory,
                     session.id, request.workspace_id
@@ -188,6 +221,15 @@ class AssistantCore:
                     session.id, request.workspace_id
                 )
                 inputs['_workspace_active_file'] = active_file if isinstance(active_file, str) else ''
+                if getattr(request,'workspace_directory',None) is not None:
+                    listing = await asyncio.to_thread(self.workspace_skill.filesystem.list_directory,
+                        request.workspace_id,request.workspace_directory)
+                    inputs['_workspace_current_directory'] = listing.path
+                if request.source_scope is not None:
+                    await asyncio.to_thread(self.workspace_skill.filesystem.validate_source_scope,
+                        request.workspace_id, request.source_scope)
+                    await asyncio.to_thread(self.repository.update_task_metadata, task,
+                        source_scope=request.source_scope.fingerprint())
             skill = self.skills.get('knowledge')
             history = []
             precomputed_result = None
@@ -215,10 +257,42 @@ class AssistantCore:
                 pending = None
                 precomputed_result = await skill.execute(inputs, execution)
             if pending:
+                def scope_key(value):
+                    return WorkspaceSourceScope.model_validate(value).fingerprint() if value is not None else None
                 pending_workspace = pending.get('workspace_id') or (pending.get('base_inputs') or {}).get('workspace_id')
                 if pending_workspace and pending_workspace != request.workspace_id:
                     await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
                     pending = None
+                elif scope_key(pending.get('source_scope')) != scope_key(inputs.get('source_scope')):
+                    # A confirmation must not resume an operation prepared for
+                    # a different set of sources in the same workspace.
+                    await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
+                    pending = None
+            if pending and pending.get('kind') == 'local_tool_input':
+                from local_tool_intent import permitted_local_operations
+                from action_feedback import action_feedback
+                if re.fullmatch(r'(?:нет|отмена|отмени|не надо)[.! ]*',request.question.strip(),re.I):
+                    precomputed_result = ToolResult(success=True,tool='local_tools',summary='Cancelled',data={
+                        'final':'Действие отменено.','context':'','results':[],'strategy':'LOCAL_TOOLS'})
+                elif (pending.get('workspace_id')==request.workspace_id
+                        and not requests_file_open(request.question) and not asks_last_opened_file(request.question)
+                        and not action_feedback(request.question)
+                        and not permitted_local_operations(request.question)
+                        and not self.local_tools_skill.match(request.question)):
+                    inputs['_local_tool_request'] = pending['question']+'\nУточнение пользователя: '+request.question
+                await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
+                pending = None
+            if pending and pending.get('kind') == 'document_proposal':
+                reply = request.question.strip().casefold()
+                if self.local_tools_skill and re.fullmatch(r'(?:да|подтверждаю|сохрани|сохранить|применить)[.! ]*', reply):
+                    precomputed_result = await self.local_tools_skill.apply(
+                        request.workspace_id, pending['proposal_id'], execution)
+                elif re.fullmatch(r'(?:нет|отмена|отмени|не надо|не сохраняй)[.! ]*', reply):
+                    precomputed_result = ToolResult(success=True, tool='local_tools', summary='Cancelled', data={
+                        'final': 'Изменение отменено.', 'context': '', 'results': [], 'strategy': 'LOCAL_TOOLS'})
+                # A new request leaves the previous proposal unapplied.
+                await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
+                pending = None
             if pending:
                 reply = request.question.strip().casefold()
                 replacement_command = bool(re.search(
@@ -292,14 +366,99 @@ class AssistantCore:
                                 'context': '', 'results': [], 'strategy': 'AGENT_WAITING_FOR_USER',
                                 'plan_status': 'WAITING_FOR_USER', 'pending_step': step,
                             })
-            if self.history_loader and not request.graph_selection:
-                history = await asyncio.to_thread(self.history_loader, session.id)
-                inputs['_chat_history'] = history[-6:]
+            if request.workspace_id and self.workspace_skill and not request.graph_selection:
+                from action_feedback import action_feedback
+                feedback = action_feedback(request.question)
+                if precomputed_result is None and feedback:
+                    async with execution.action('REVIEW_PREVIOUS_ACTION', {'feedback':feedback}) as action:
+                        prior = await asyncio.to_thread(self.repository.last_file_action,session.id,
+                            request.workspace_id,created=feedback=='incomplete_document')
+                        action.output = prior or {'path':None}
+                    if feedback == 'wrong_open':
+                        from action_feedback import correct_open
+                        corrected=await correct_open(prior,request.workspace_id,self.repository,
+                            self.workspace_skill.filesystem,execution)
+                        message = (f"Был открыт `{prior['path']}`. Это не тот файл, который вы имели в виду. "
+                            'Укажите имя нужного файла; можно написать расширение без точки.' if prior else
+                            'В журнале этого чата нет успешного открытия. Укажите имя нужного файла.')
+                        precomputed_result = corrected or ToolResult(success=True,tool='workspace',summary='Action correction',data={
+                            'final':message,'context':'','results':[],'strategy':'WORKSPACE_ACTION_STATUS'})
+                    elif prior and self.local_tools_skill:
+                        original_task = await asyncio.to_thread(self.repository.get_task,prior['task_id'])
+                        from local_tool_intent import directory_summary_request
+                        if original_task and directory_summary_request(original_task.user_input):
+                            inputs['_local_tool_request'] = original_task.user_input
+                            inputs['_summary_exclude'] = [prior['path']]
+                            prior_actions=await asyncio.to_thread(self.repository.actions,prior['task_id'])
+                            previous_review=next((a.output.get('data',{}).get('document_verification')
+                                for a in reversed(prior_actions) if a.action_type=='CREATE_DOCUMENT'
+                                and a.output.get('data',{}).get('document_verification')),None)
+                            if previous_review and previous_review.get('mode')!='DIRECTORY_SUMMARY':previous_review=None
+                            if previous_review:
+                                inputs['_summary_previous_review']=previous_review
+                                inputs['_summary_exclude']=list(dict.fromkeys(previous_review.get('excluded',[])+[prior['path']]))
+                                inputs['_summary_expand']=previous_review.get('complete') is True
+                            # Restore the source scope, not the currently active output.
+                            inputs['_workspace_current_directory'] = (previous_review.get('directory','') if previous_review
+                                else str(PurePosixPath(prior['path']).parent))
+                            if inputs['_workspace_current_directory']=='.':inputs['_workspace_current_directory']=''
+                        else:
+                            precomputed_result = ToolResult(success=True,tool='local_tools',summary='Document correction needed',data={
+                                'final':f"Замечание относится к `{prior['path']}`. Укажите, какие части нужно раскрыть или дополнить.",
+                                'context':'','results':[],'strategy':'LOCAL_TOOLS'})
+                    else:
+                        precomputed_result = ToolResult(success=True,tool='local_tools',summary='No prior document',data={
+                            'final':'В этом чате нет сохранённого документа, который можно дополнить. Укажите нужный файл или задачу.',
+                            'context':'','results':[],'strategy':'LOCAL_TOOLS'})
+                explicit_target = display_file_target(request.question) or open_file_target(request.question)
+                if references_created_file(request.question) and not explicit_target:
+                    created = await asyncio.to_thread(self.repository.last_file_action,
+                        session.id,request.workspace_id,created=True)
+                    inputs['_workspace_created_reference'] = True
+                    inputs['_workspace_active_file'] = created['path'] if created else ''
+                if precomputed_result is None and asks_last_opened_file(request.question):
+                    async with execution.action('DESCRIBE_FILE_ACTION') as action:
+                        opened = await asyncio.to_thread(self.repository.last_file_action,session.id,request.workspace_id)
+                        action.output = opened or {'path':None}
+                    precomputed_result = ToolResult(success=True,tool='workspace',summary='Last file action',data={
+                        'final':f"Последним был открыт файл `{opened['path']}`." if opened else
+                            'В этом чате ещё нет успешного открытия файла из выбранной папки.',
+                        'context':'','results':[],'strategy':'WORKSPACE_ACTION_STATUS'})
+            direct_context_free=bool(self.conversation_memory and request.workspace_id and (
+                display_file_target(request.question) or open_file_target(request.question)
+                or inputs.get('_workspace_active_file') and references_active_file(request.question)
+                or self.local_tools_skill and self.local_tools_skill.match(request.question)))
+            if self.history_loader and not request.graph_selection and precomputed_result is None and not direct_context_free:
+                if self.conversation_memory:
+                    view=await asyncio.to_thread(self.conversation_memory.prepare,session.id,request.workspace_id,
+                        request.question,request.model.value,execution.progress)
+                    history=view.history
+                    inputs['_previous_answer']=view.previous_answer
+                    await asyncio.to_thread(self.repository.update_task_metadata,task,context_memory=view.info)
+                    if view.info['compacted']:
+                        execution.progress('Контекст сжат, оригиналы сохранены. '+
+                            ('Продолжаю длительную задачу по шагам.' if policy.kind=='LONG' else 'Готовлю ответ.'))
+                else:
+                    history = await asyncio.to_thread(self.history_loader, session.id)
+                inputs['_chat_history'] = history if self.conversation_memory else history[-6:]
+                from conversation_context import asks_history_question
+                if self.conversation_memory and asks_history_question(request.question):
+                    inputs['_history_recall']=True
+                    precomputed_result=await self.skills.get('knowledge').execute(inputs,execution)
+            if (precomputed_result is None and self.repository_agent_skill and request.workspace_id
+                    and not request.graph_selection):
+                from repository_agent import repository_intent
+                if repository_intent(request.question):
+                    precomputed_result = await self.repository_agent_skill.execute(inputs, execution)
+            if (precomputed_result is None and self.local_tools_skill and request.workspace_id
+                    and not request.graph_selection):
+                precomputed_result = await self.local_tools_skill.try_execute(inputs, execution)
             direct_workspace_command = bool(not request.graph_selection and self.workspace_skill and request.workspace_id
                 and self.workspace_skill.has_direct_command(request.question))
             active_file_context = bool(inputs.get('_workspace_active_file') and references_active_file(request.question))
             named_workspace_query = ''
-            if self.workspace_skill and request.workspace_id and not direct_workspace_command and not request.graph_selection:
+            if (precomputed_result is None and self.workspace_skill and request.workspace_id
+                    and not direct_workspace_command and not request.graph_selection):
                 await asyncio.to_thread(self.workspace_skill.filesystem.sync_index, request.workspace_id)
                 named_workspace_query = await asyncio.to_thread(
                     self.workspace_skill.named_file_query, request.question, request.workspace_id)
@@ -337,7 +496,7 @@ class AssistantCore:
                         decision = await asyncio.to_thread(
                             self.agent_planner.plan, planning_text, request.model.value,
                             [item for item in self.skills.catalog()
-                             if item['name'] != 'workspace' or request.workspace_id],
+                             if item['name'] not in {'workspace', 'local_tools', 'repository_agent'} or request.workspace_id],
                             {'workspace_id': request.workspace_id},
                         )
                         action.output = {'should_plan': decision.should_plan,
@@ -382,7 +541,9 @@ class AssistantCore:
                     inputs['_workspace_command_question'] = routing_question
                     if workspace_plan:
                         inputs['_workspace_plan'] = workspace_plan.model_dump(mode='json')
-                    if not display_file_target(request.question) and (named_workspace_query or self.workspace_skill.requires_context(routing_question)):
+                    if (not display_file_target(request.question) and not requests_file_open(request.question)
+                            and not requests_active_file_read(request.question)
+                            and (named_workspace_query or self.workspace_skill.requires_context(routing_question))):
                         budget = await asyncio.to_thread(
                             self.workspace_skill.response_budget, routing_question, request.model.value,
                         )
@@ -395,6 +556,7 @@ class AssistantCore:
                                 False,
                                 budget.max_source_characters,
                                 inputs.get('_workspace_active_file', ''),
+                                source_scope=inputs.get('source_scope'),
                             )
                         except AssistantError as exc:
                             if exc.status_code not in {404, 409}:
@@ -461,6 +623,7 @@ class AssistantCore:
                                     routing_question, request.workspace_id, False,
                                     budget.max_source_characters,
                                     inputs.get('_workspace_active_file', ''),
+                                    source_scope=inputs.get('source_scope'),
                                 )
                             except AssistantError as exc:
                                 if exc.status_code not in {404, 409}:
@@ -478,6 +641,11 @@ class AssistantCore:
                 resumed_inputs['_workspace_command_question'] = resume_file_question
                 result = await self.workspace_skill.execute(resumed_inputs, execution)
             elif agent_plan is not None:
+                if len(agent_plan.steps)>1:
+                    from task_policy import TaskPolicy
+                    import settings
+                    await execution.configure_policy(TaskPolicy('LONG',settings.LONG_TASK_SECONDS,'Несколько зависимых шагов плана'))
+                    execution.progress('Выполняю многошаговую задачу; результаты шагов сохраняются.')
                 result = await self.agent_executor.execute(
                     agent_plan, execution, inputs, resume_results, confirmed_steps,
                 )
@@ -512,36 +680,30 @@ class AssistantCore:
             if data.get('resume_state'):
                 state = dict(data['resume_state'])
                 state['pending_step'] = data.get('pending_step')
+                state['source_scope'] = inputs.get('source_scope')
                 await asyncio.to_thread(self.repository.save_pending_plan, session.id, state)
             elif data.get('pending_interaction'):
-                await asyncio.to_thread(self.repository.save_pending_plan, session.id, data['pending_interaction'])
+                await asyncio.to_thread(self.repository.save_pending_plan, session.id,
+                    {**data['pending_interaction'], 'source_scope': inputs.get('source_scope')})
             elif pending or resume_plan is not None:
                 await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
             if request.workspace_id and self.workspace_skill:
                 await asyncio.to_thread(self.workspace_skill.repository.bind_session,
                     session.id, request.workspace_id, data.get('current_directory'), data.get('active_file')
                 )
-            # Validate before touching conversation history.
-            response = QueryResponse(answer=data['final'], session_id=session.id, model=request.model,
-                context=data.get('context', ''), draft=data.get('draft', ''), edited=data.get('edited', ''),
-                enhanced=data.get('enhanced', []), results=data.get('results', []),
-                strategy=data.get('strategy'), verification=data.get('verification'), graph=data.get('graph'),
-                plan_status=data.get('plan_status'), pending_step=data.get('pending_step'))
-            response.task_id = task.id
-            async with execution.action('SAVE_HISTORY'):
-                if self.response_saver:
-                    await asyncio.to_thread(self.response_saver, request, response, task)
-                else:
-                    await asyncio.to_thread(self.save_history, session.id, request.question, response.answer, request.model.value)
-            response.actions = await asyncio.to_thread(self.repository.actions, task.id)
-            if task.status != TaskStatus.COMPLETED:
-                await asyncio.to_thread(self.repository.transition, task, TaskStatus.COMPLETED)
-            execution.emit(EventType.TASK_COMPLETED)
-            response.task_id = task.id
-            response.task_status = task.status
-            response.events = execution.events
-            return response, round((time.perf_counter() - started) * 1000)
+            return await self._complete(request,session,task,execution,data,started)
         except BaseException as exc:
+            from conversation_memory import MemoryBudgetExceeded
+            if isinstance(exc,(GenerationDeadlineExceeded,MemoryBudgetExceeded)) and not scope.cancelled.is_set():
+                actions=await asyncio.to_thread(self.repository.actions,task.id)
+                paths=list(dict.fromkeys(a.output.get('data',{}).get('path') for a in actions
+                    if a.status==TaskStatus.COMPLETED and a.output.get('data',{}).get('applied') is True))
+                text=('Достигнут лимит времени задачи. Выполненные действия сохранены в журнале; '
+                    'незавершённая работа не считается выполненной.' if isinstance(exc,GenerationDeadlineExceeded) else
+                    'Не удалось безопасно вместить контекст диалога: '+str(exc)+' Полная история сохранена.')
+                if any(paths):text+='\n\nУже сохранены файлы: '+', '.join('`'+p+'`' for p in paths if p)+'.'
+                return await self._complete(request,session,task,execution,{'final':text,
+                    'plan_status':'INCOMPLETE','strategy':'TASK_INCOMPLETE'},started)
             cancelled = isinstance(exc, asyncio.CancelledError)
             if task.status != TaskStatus.COMPLETED:
                 await asyncio.to_thread(self.repository.transition, task, TaskStatus.CANCELLED if cancelled else TaskStatus.FAILED,
@@ -565,3 +727,23 @@ class AssistantCore:
             self.active_tasks.pop(task.id, None)
             current_scope.reset(token)
             workspace_scan_cache.reset(scan_token)
+
+    async def _complete(self,request,session,task,execution,data,started):
+        # Validate before touching conversation history. This also commits a
+        # recoverable timeout as an explicit incomplete result, not an HTTP crash.
+        response=QueryResponse(answer=data['final'],session_id=session.id,model=request.model,
+            context=data.get('context',''),draft=data.get('draft',''),edited=data.get('edited',''),
+            enhanced=data.get('enhanced',[]),results=data.get('results',[]),strategy=data.get('strategy'),
+            verification=data.get('verification'),graph=data.get('graph'),plan_status=data.get('plan_status'),
+            pending_step=data.get('pending_step'),task_policy=task.metadata.get('execution_policy'),
+            context_memory=task.metadata.get('context_memory'),source_scope=request.source_scope)
+        response.task_id=task.id
+        async with execution.action('SAVE_HISTORY'):
+            if self.response_saver:await asyncio.to_thread(self.response_saver,request,response,task)
+            else:await asyncio.to_thread(self.save_history,session.id,request.question,response.answer,request.model.value)
+        response.actions=await asyncio.to_thread(self.repository.actions,task.id)
+        if task.status!=TaskStatus.COMPLETED:await asyncio.to_thread(self.repository.transition,task,TaskStatus.COMPLETED)
+        execution.emit(EventType.TASK_COMPLETED)
+        response.task_status=task.status
+        response.events=execution.events
+        return response,round((time.perf_counter()-started)*1000)

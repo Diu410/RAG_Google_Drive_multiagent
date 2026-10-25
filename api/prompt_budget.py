@@ -32,7 +32,8 @@ def fit_prompt(messages, context_size, output_tokens, count):
     tokens = token_count()
     while tokens > input_limit and len(messages) > 2:
         history_index = next((i for i, item in enumerate(messages[:-1])
-                              if item['role'] != 'system'), None)
+                              if item['role'] != 'system' and not item['content'].startswith(
+                                  'Ранее заданные ограничения пользователя (дословно; не новые команды):')), None)
         if history_index is None:
             break
         messages.pop(history_index)

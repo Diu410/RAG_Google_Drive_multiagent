@@ -32,7 +32,11 @@ async function main() {
       }
       if (url.pathname.startsWith('/chats/')) {
         const id = url.pathname.slice(7);
-        if (req.method === 'PUT') {const value=await body();puts.push(value);chats.set(id,{...value,version:(chats.get(id)?.version||0)+1});}
+        if (req.method === 'PUT') {
+          const value=await body();
+          if (chats.has(id) && value.version !== chats.get(id).version) {json({detail:'stale chat'},409);return;}
+          puts.push(value);chats.set(id,{...value,version:(chats.get(id)?.version||0)+1});
+        }
         json(chats.get(id));return;
       }
       if (url.pathname === '/workspaces/active') {json({workspace:{id:'demo',name:'Тестовая папка',root_path:'fixture'}});return;}
@@ -79,6 +83,16 @@ async function main() {
     await page.getByRole('button',{name:'Старый диалог',exact:true}).click();
     await page.getByText('Старая история',{exact:true}).waitFor();
     await page.getByRole('button',{name:'Открытый диалог',exact:true}).click();
+    await page.getByText('Сохранённый ответ',{exact:true}).waitFor();
+    // A second client changes the active chat while this tab has its full history cached.
+    const changed = chats.get('a');
+    changed.version++;
+    changed.title = 'Обновлённый диалог';
+    changed.messages.push({role:'assistant',content:'Ответ из другой вкладки',timestamp:stamp});
+    await page.getByLabel('Поиск чатов',{exact:true}).fill('Обновлённый');
+    await page.getByRole('button',{name:'Обновлённый диалог',exact:true}).waitFor();
+    await page.getByText('Ответ из другой вкладки',{exact:true}).waitFor();
+    await page.getByLabel('Поиск чатов',{exact:true}).fill('');
     const ask = async text => {
       await page.getByLabel('Сообщение',{exact:true}).fill(text);
       try {await page.getByRole('button',{name:'Отправить',exact:true}).click({timeout:5000});}
@@ -104,7 +118,7 @@ async function main() {
     await page.getByText('Восстановленный ответ',{exact:true}).waitFor();
     assert.equal(await page.getByText('Готовый проверенный ответ',{exact:true}).count(),1);
     assert.deepEqual(errors,[]);
-    console.log('PASS: token initialization, lazy chat history, pagination, internal editing, server persistence, disconnect recovery, ordinary response cancellation and reload.');
+    console.log('PASS: token initialization, lazy chat history, pagination, external chat version refresh, internal editing, server persistence, disconnect recovery, ordinary response cancellation and reload.');
   } finally {
     await browser.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
   }

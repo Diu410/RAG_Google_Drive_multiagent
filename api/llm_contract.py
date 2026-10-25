@@ -29,6 +29,8 @@ class GenerationScope:
     task_id: str
     cancelled: Event = field(default_factory=Event)
     deadline: float | None = None
+    started_at: float = field(default_factory=time.perf_counter)
+    task_kind: str = 'STANDARD'
 
     def remaining_seconds(self):
         return None if self.deadline is None else max(0, self.deadline - time.perf_counter())

@@ -90,6 +90,33 @@ class ContextualReviewTests(unittest.TestCase):
     def review(self, answer, provider, question='Что известно из письма?', sources=None):
         return review_answer(question, answer, sources or [SOURCE], 'WORKSPACE_QA', 'FAST', client=provider)
 
+    def test_short_heading_is_literal_context_without_bypassing_independent_audit(self):
+        source = {'chunk_id': 'archive', 'text': '# Хранитель\nХранитель — смотритель архива. Его имя — Мирон.'}
+        claim = 'Хранителя зовут Мирон.'
+        def supported(packet):
+            quotes = packet['sources'][0]['passages']
+            self.assertTrue(all(len(' '.join(text.split())) >= 12 for text in quotes.values()))
+            self.assertTrue(all(text in source['text'] for text in quotes.values()))
+            return {'assessments': {key: {'v': 'S', 'p': True, 'q': list(quotes)}
+                    for key in packet['assess_only']}, 'issues': []}
+        provider = ReviewProvider([supported])
+        answer, check = self.review(claim, provider, sources=[source])
+        self.assertEqual(answer, claim)
+        self.assertEqual(check.status, 'SUPPORTED')
+        self.assertEqual(len(provider.audit_calls), 1)
+        self.assertTrue(check.review_details['evidence_audits'])
+
+    def test_short_heading_never_grants_support_when_independent_audit_rejects(self):
+        source = {'chunk_id': 'archive', 'text': '# Хранитель\nХранитель хранит карты.'}
+        claim = 'Хранитель хранит деньги.'
+        def supported(packet):
+            return {'assessments': {key: {'v': 'S', 'p': True,
+                    'q': list(packet['sources'][0]['passages'])} for key in packet['assess_only']}, 'issues': []}
+        provider = ReviewProvider([supported, supported], audits={claim: {'same_predicate': False}})
+        _, check = self.review(claim, provider, sources=[source])
+        self.assertEqual(check.status, 'UNSUPPORTED')
+        self.assertEqual(len(provider.audit_calls), 1)
+
     def test_uncertain_sentence_does_not_erase_explanation_or_paragraphs(self):
         draft = FACT + '\n\n' + GUESS
         provider = ReviewProvider([lambda p: payload(p, {GUESS: ('UNSUPPORTED', None, True)},
@@ -372,6 +399,74 @@ class ContextualReviewTests(unittest.TestCase):
         self.assertNotIn('SYNTHESIZE_OVERVIEW', actions)
         self.assertNotIn('VERIFY_DOCUMENTARY_OVERVIEW', actions)
         self.assertIn('FINALIZE_RESPONSE', actions)
+
+    def test_contextual_overview_focuses_writer_but_keeps_all_review_sources(self):
+        environment=support.UserEnvironment()
+        self.addCleanup(environment.close)
+        provider=ReviewProvider(draft=FACT)
+        with patch('settings.ANSWER_REVIEW_MODE','contextual'), \
+                patch('model_runtime.get_llm_provider',return_value=provider):
+            asyncio.run(environment.execute('Кто такой Мирон?',_workspace_matches=[
+                {'path':'Письмо.md','content':'В письме Мирон называет себя хранителем карт.','score':5},
+                {'path':'Другое.md','content':'Совет читателю: воспринимать любую боль как прогресс.','score':1}]))
+        writer=provider.generation_calls[0][0][-1]['content']
+        self.assertIn('Мирон',writer)
+        self.assertNotIn('любую боль',writer)
+        review_packet=json.loads(provider.calls[0]['messages'][-1]['content'])
+        self.assertEqual(len(review_packet['sources']),2)
+
+    def test_source_followup_does_not_replay_old_assistant_assertions_to_writer(self):
+        environment=support.UserEnvironment()
+        self.addCleanup(environment.close)
+        provider=ReviewProvider(draft=FACT)
+        with patch('settings.ANSWER_REVIEW_MODE','contextual'), \
+                patch('model_runtime.get_llm_provider',return_value=provider):
+            asyncio.run(environment.execute('Чего он хранитель?',_workspace_matches=[
+                {'path':'Письмо.md','content':SOURCE['text'],'score':5}],_depends_on_history=True,
+                _retrieval_question='Чего Мирон хранитель?',_chat_history=[
+                    {'role':'user','content':'Кто такой Мирон?'},
+                    {'role':'assistant','content':'OLD_UNVERIFIED_ASSERTION: владелец Луны.'}]))
+        messages=provider.generation_calls[0][0]
+        self.assertNotIn('OLD_UNVERIFIED_ASSERTION',' '.join(m['content'] for m in messages))
+        self.assertTrue(any(m['content']=='Кто такой Мирон?' for m in messages))
+
+    def test_authored_description_does_not_use_suggested_affirmation_as_identity(self):
+        environment=support.UserEnvironment()
+        self.addCleanup(environment.close)
+        example='Нужно проговаривать пример: «Я Мирон, я властелин Луны».'
+        provider=ReviewProvider(draft=FACT)
+        with patch('settings.ANSWER_REVIEW_MODE','contextual'), \
+                patch('model_runtime.get_llm_provider',return_value=provider):
+            asyncio.run(environment.execute('Кто такой Мирон? Ответь кратко.',_document_authoring=True,
+                _authoring_request='Создай документ о Мироне',_workspace_matches=[
+                    {'path':'Письмо.md','content':'В письме Мирон называет себя хранителем карт.','score':5},
+                    {'path':'Приём.md','content':example,'score':1}]))
+        writer=provider.generation_calls[0][0][-1]['content']
+        self.assertNotIn('властелин Луны',writer)
+        packet=json.loads(provider.calls[0]['messages'][-1]['content'])
+        self.assertEqual(len(packet['sources']),2)
+
+    def test_person_overview_does_not_inherit_biography_from_suggested_self_example(self):
+        environment=support.UserEnvironment()
+        self.addCleanup(environment.close)
+        provider=ReviewProvider(draft=FACT)
+        with patch('settings.ANSWER_REVIEW_MODE','contextual'), \
+                patch('model_runtime.get_llm_provider',return_value=provider):
+            asyncio.run(environment.execute('Кто такой Мирон?',_workspace_matches=[
+                {'path':'Письмо.md','content':'В письме Мирон называет себя хранителем карт.','score':5},
+                {'path':'Приём.md','content':'Нужно проговаривать: «Я Мирон, во мне одна ярость».','score':1}]))
+        self.assertNotIn('одна ярость',provider.generation_calls[0][0][-1]['content'])
+        self.assertEqual(len(json.loads(provider.calls[0]['messages'][-1]['content'])['sources']),2)
+
+    def test_explicit_question_about_self_example_keeps_its_original_context(self):
+        environment=support.UserEnvironment()
+        self.addCleanup(environment.close)
+        provider=ReviewProvider(draft=FACT)
+        with patch('settings.ANSWER_REVIEW_MODE','contextual'), \
+                patch('model_runtime.get_llm_provider',return_value=provider):
+            asyncio.run(environment.execute('Кто такой Мирон в примере самовнушения?',_workspace_matches=[
+                {'path':'Приём.md','content':'Нужно проговаривать: «Я Мирон, во мне одна ярость».','score':1}]))
+        self.assertIn('Нужно проговаривать',provider.generation_calls[0][0][-1]['content'])
 
     def test_workspace_timeout_preserves_the_explanation_and_journals_actual_answer(self):
         environment = support.UserEnvironment()

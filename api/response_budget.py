@@ -52,7 +52,8 @@ _DETAIL_RE = re.compile(
     r"\b(?:подробн\w*|детальн\w*|разв[её]рнут\w*|глубок\w*|проанализир\w*|"
     r"исчерпывающ\w*|по пунктам)\b", re.IGNORECASE,
 )
-_BRIEF_RE = re.compile(r"\b(?:кратко|коротко|одним предложением|без подробностей)\b", re.IGNORECASE)
+_BRIEF_RE = re.compile(r"\b(?:кратко|коротко|одним предложением|без подробностей|"
+                        r"(?:кратк\w*|коротк\w*)\s+(?:ответ|расч[её]т|объяснени|вывод)\w*)\b", re.IGNORECASE)
 _BROAD_RE = re.compile(
     r"\b(?:все(?:х|ми)?|весь|всю|всё|кажд\w*|целиком|полностью|внутри директор\w*|"
     r"по всем файлам|обзор)\b",
@@ -71,6 +72,11 @@ class ResponseBudgetPlanner:
             coverage = ContextCoverage.BROAD if _BROAD_RE.search(question) else ContextCoverage.BALANCED
             return BudgetDecision(detail=AnswerDetail.DETAILED, coverage=coverage, confidence=1,
                                   reason="Пользователь явно запросил подробный анализ")
+        from conversation_context import strip_dialogue_prefix
+        if len(question.split())<=30 and not _BROAD_RE.search(question) and re.match(r'^(?:чего|чей|чья|чь[её]|чьи|кому|кем|кого|чему)\b',
+                                                  strip_dialogue_prefix(question),re.I):
+            return BudgetDecision(detail=AnswerDetail.BRIEF,coverage=ContextCoverage.FOCUSED,
+                                  confidence=1,reason='Узкий вопрос об участнике или принадлежности')
         from source_grounding import requests_source_overview
         if requests_source_overview(question) and len(question.split()) <= 12:
             return BudgetDecision(detail=AnswerDetail.NORMAL,

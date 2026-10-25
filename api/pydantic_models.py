@@ -1,5 +1,6 @@
 # api/pydantic_models.py
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from workspace_source_scope import WorkspaceSourceScope
 from enum import Enum
 from datetime import datetime
 from assistant_models import Action, AssistantEvent, TaskStatus
@@ -73,8 +74,16 @@ class QueryInput(BaseModel):
     use_multi_agent: bool = Field(default=False)
     search_mode: SearchMode | None = Field(default=None)
     workspace_id: str | None = Field(default=None, max_length=128)
+    workspace_directory: str | None = Field(default=None, max_length=500)
+    source_scope: WorkspaceSourceScope | None = None
     live_mode: bool = Field(default=False)
     graph_selection: GraphSelection | None = None
+
+    @model_validator(mode='after')
+    def source_selection(self):
+        if self.source_scope is not None and (not self.workspace_id or self.graph_selection):
+            raise ValueError('Область источников требует workspace и не совмещается с выбором графа.')
+        return self
 
     @field_validator('question')
     @classmethod
@@ -100,6 +109,9 @@ class QueryResponse(BaseModel):
     pending_step: dict | None = None
     task_id: str | None = None
     task_status: TaskStatus | None = None
+    task_policy: dict | None = None
+    context_memory: dict | None = None
+    source_scope: WorkspaceSourceScope | None = None
     actions: list[Action] = Field(default_factory=list)
     events: list[AssistantEvent] = Field(default_factory=list)
 

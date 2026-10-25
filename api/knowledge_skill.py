@@ -4,6 +4,7 @@ RAG_PIPELINE is deliberately a single high-level action: the existing chain owns
 retrieval and generation. No source chunks are copied to the execution journal.
 """
 import asyncio
+from conversation_context import normalized_history
 import logging
 import re
 from dataclasses import dataclass
@@ -53,8 +54,11 @@ class KnowledgeSkill:
         session_id = execution.task.session_id
         model = query_input.model.value
         retrieval_question = inputs.get('_retrieval_question') or query_input.question
+        from conversation_context import asks_history_question
         async with execution.action('ROUTE_QUERY') as action:
-            route = (RouteDecision(strategy=QueryStrategy.GRAPH_QUERY, confidence=1.0)
+            route = (RouteDecision(strategy=QueryStrategy.GENERAL_CHAT, confidence=1.0)
+                     if inputs.get('_history_recall') and asks_history_question(query_input.question) else
+                     RouteDecision(strategy=QueryStrategy.GRAPH_QUERY, confidence=1.0)
                      if inputs.get('_graph_focus') else
                      await asyncio.to_thread(self.services.route, retrieval_question, model))
             action.output = {'strategy': route.strategy.value}
@@ -90,7 +94,7 @@ class KnowledgeSkill:
                 if chain is None:
                     raise AssistantError('RAG unavailable. Check model provider and Chroma.', 503)
                 chain_response = await asyncio.to_thread(
-                    chain.invoke, {"input": retrieval_question, "chat_history": history[-6:]}
+                    chain.invoke, {"input": retrieval_question, "chat_history": normalized_history(history)}
                 )
                 result = {
                     "final": chain_response["answer"],

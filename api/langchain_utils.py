@@ -141,4 +141,5 @@ def answer_general_chat(question, chat_history, model=None, live_mode=False):
         MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}"),
     ])
-    return (prompt | llm).invoke({"input": question, "chat_history": chat_history[-6:]}).content
+    from conversation_context import normalized_history
+    return (prompt | llm).invoke({"input": question, "chat_history": normalized_history(chat_history)}).content

@@ -22,11 +22,16 @@ export type AssistantEvent = {
   task_id: string; session_id: string; action_id: string | null; timestamp: string;
 };
 export type ExecutionMetadata = {task_id?: string; task_status?: TaskStatus; actions?: Action[]; events?: AssistantEvent[]};
+export type WorkspaceSourceScope =
+  | {kind: 'workspace'}
+  | {kind: 'directory'; directory: string}
+  | {kind: 'files'; files: string[]};
 export type AssistantInput = {
   question: string; session_id?: string | null; chat_id?: string;
   request_id?: string;
-  model: string; use_multi_agent?: boolean; workspace_id?: string | null;
+  model: string; use_multi_agent?: boolean; workspace_id?: string | null; workspace_directory?: string;
   live_mode?: boolean;
+  source_scope?: WorkspaceSourceScope | null;
   graph_selection?: GraphSelection;
 };
 

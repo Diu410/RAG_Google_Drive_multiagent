@@ -21,6 +21,14 @@ class AssistantRepository:
                 task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, request_id TEXT,
                 request_fingerprint TEXT NOT NULL, response TEXT NOT NULL,
                 UNIQUE(session_id, request_id))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS assistant_history_scopes (
+                log_id INTEGER PRIMARY KEY, scope_key TEXT NOT NULL)''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS assistant_context_origins (
+                session_id TEXT PRIMARY KEY, scope_key TEXT NOT NULL)''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS assistant_context_checkpoints (
+                session_id TEXT NOT NULL, scope_key TEXT NOT NULL, epoch INTEGER NOT NULL,
+                version INTEGER NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY(session_id,scope_key,epoch))''')
             if conn.execute('SELECT 1 FROM assistant_migrations WHERE version=1').fetchone():
                 conn.execute('''CREATE TABLE IF NOT EXISTS assistant_pending_plans (
                     session_id TEXT PRIMARY KEY REFERENCES assistant_sessions(id) ON DELETE CASCADE,
@@ -133,6 +141,41 @@ class AssistantRepository:
         return self._insert('assistant_actions', Action(id=str(uuid.uuid4()), task_id=task_id,
             action_type=action_type, input=inputs or {}))
 
+    def last_file_action(self, session_id, workspace_id, *, created=False):
+        """Read completed file effects, scoped to the original chat and workspace.
+
+        Created artifacts come from an applied create/conversion, never a
+        preview, a filename suggested by the model or the assistant's prose.
+        This also recovers artifacts from turns preceding a backend upgrade.
+        """
+        with closing(self.connection_factory()) as conn:
+            rows = conn.execute(f'''SELECT a.input,a.output,a.task_id,a.action_type
+                FROM assistant_actions a JOIN assistant_tasks t ON t.id=a.task_id
+                WHERE t.session_id=? AND a.status='COMPLETED' AND a.action_type=?
+                ORDER BY a.completed_at DESC,a.rowid DESC''',
+                (session_id,'APPLY_DOCUMENT_CHANGE' if created else 'OPEN_FILE'))
+            for row in rows:
+                try:
+                    inputs, output = json.loads(row['input']), json.loads(row['output'])
+                    data = output.get('data',output)
+                    if inputs.get('workspace_id') != workspace_id or output.get('success') is False:
+                        continue
+                    path = data.get('path') or inputs.get('path')
+                    if not isinstance(path,str) or not path or (created and data.get('applied') is not True):
+                        continue
+                    if created:
+                        # Confirmation may be a separate turn from preparation.
+                        # Old journal entries predate `operation`: every applied
+                        # edit records its backup; every new output records None.
+                        operation = data.get('operation')
+                        if operation != 'create' and (operation is not None
+                                or 'backup_path' not in data or data['backup_path'] is not None):
+                            continue
+                    return {'path':path,'task_id':row['task_id'],'action_type':row['action_type']}
+                except (ValueError,TypeError,AttributeError):
+                    continue
+        return None
+
     def save_pending_plan(self, session_id, state):
         with closing(self.connection_factory()) as conn, conn:
             conn.execute('''INSERT INTO assistant_pending_plans(session_id,state,updated_at) VALUES(?,?,?)
@@ -153,11 +196,21 @@ class AssistantRepository:
         with closing(self.connection_factory()) as conn:
             return self._decode(Task, conn.execute('SELECT * FROM assistant_tasks WHERE id=?', (task_id,)).fetchone())
 
+    def update_task_metadata(self, task, **values):
+        task.metadata.update(values)
+        with closing(self.connection_factory()) as conn, conn:
+            conn.execute('UPDATE assistant_tasks SET metadata=? WHERE id=?',
+                (json.dumps(task.metadata,ensure_ascii=False),task.id))
+
     @staticmethod
     def _request_fingerprint(request):
-        return json.dumps({'question': request.question, 'workspace_id': request.workspace_id,
-            'graph_selection': request.graph_selection.model_dump(mode='json') if request.graph_selection else None},
-            sort_keys=True, ensure_ascii=False)
+        data = {'question': request.question, 'workspace_id': request.workspace_id,
+            'graph_selection': request.graph_selection.model_dump(mode='json') if request.graph_selection else None}
+        if request.source_scope is not None:
+            data['source_scope'] = request.source_scope.fingerprint()
+        if request.workspace_directory is not None:
+            data['workspace_directory'] = request.workspace_directory
+        return json.dumps(data, sort_keys=True, ensure_ascii=False)
 
     def saved_response(self, session_id, request):
         if not request.request_id:
@@ -186,9 +239,13 @@ class AssistantRepository:
             conn.execute('BEGIN IMMEDIATE')
             ensure_chat_schema(conn)
             response.chat_version = append_response(conn, request, response)
-            conn.execute('INSERT INTO application_logs(session_id,user_query,gpt_response,model,knowledge_epoch) '
+            inserted=conn.execute('INSERT INTO application_logs(session_id,user_query,gpt_response,model,knowledge_epoch) '
                 'VALUES(?,?,?,?,?)', (response.session_id, request.question, response.answer,
                                      request.model.value, get_knowledge_epoch(conn)))
+            conn.execute('INSERT INTO assistant_history_scopes(log_id,scope_key) VALUES(?,?)',
+                (inserted.lastrowid,request.workspace_id or 'LIBRARY'))
+            conn.execute('INSERT OR IGNORE INTO assistant_context_origins(session_id,scope_key) VALUES(?,?)',
+                (response.session_id,request.workspace_id or 'LIBRARY'))
             scope = current_scope.get()
             if scope and scope.cancelled.is_set():
                 raise GenerationCancelled()

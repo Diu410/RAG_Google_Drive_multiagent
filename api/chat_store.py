@@ -30,12 +30,20 @@ def append_response(conn, request, response):
                           if message.get('role') == 'user' and (
                               message.get('id') == request_id if request_id else message.get('content') == request.question)), None)
     if not matching_user:
-        messages.append({'role': 'user', 'content': request.question, 'timestamp': now, 'id': request_id})
+        matching_user = {'role': 'user', 'content': request.question, 'timestamp': now, 'id': request_id}
+        messages.append(matching_user)
+    matching_user.update(workspace_id=request.workspace_id,
+        source_scope=request.source_scope.model_dump(mode='json') if request.source_scope else None)
+    if request.workspace_directory is not None:
+        matching_user['workspace_directory'] = request.workspace_directory
     messages.append({'role': 'assistant', 'content': response.answer, 'timestamp': now,
         'reply_to': request_id, 'task_id': response.task_id,
         'context': response.context, 'strategy': response.strategy,
+        'task_policy':response.task_policy,'context_memory':response.context_memory,
         'verification': response.verification.model_dump(mode='json') if response.verification else None,
         'graph': response.graph,
+        'results': [item.model_dump(mode='json') for item in response.results],
+        'source_scope': response.source_scope.model_dump(mode='json') if response.source_scope else None,
         'steps': {'draft': response.draft, 'edited': response.edited, 'enhanced': response.enhanced}})
     version = (row['version'] if row else 0) + 1
     chat.update(session_id=response.session_id, updated_at=now, version=version)

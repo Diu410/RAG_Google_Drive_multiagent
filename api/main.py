@@ -14,6 +14,8 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 from pathlib import Path
+from typing import Literal
+from datetime import datetime, timezone
 from pydantic_models import (QueryInput, QueryResponse, DocumentInfo, DeleteFileRequest,
                              UploadGDriveRequest, SearchRequest, SearchResult, ReindexRequest)
 from langchain_utils import get_rag_chain, answer_general_chat
@@ -255,6 +257,14 @@ async def stream_voice(payload: dict = Body(...)):
 
 workspace_repository = WorkspaceRepository()
 filesystem_provider = FilesystemProvider(workspace_repository)
+from workspace_documents import WorkspaceDocuments
+from workspace_repository_tools import RepositoryTools
+from local_tools_skill import LocalToolsSkill
+from local_tools_routes import local_tools_router
+workspace_documents = WorkspaceDocuments(filesystem_provider)
+repository_tools = RepositoryTools(filesystem_provider)
+local_tools_skill = LocalToolsSkill(workspace_documents, repository_tools)
+app.include_router(local_tools_router(workspace_documents, repository_tools))
 workspace_vector_index = WorkspaceVectorIndex(
     filesystem_provider, graph_repository=WorkspaceGraphRepository()
 )
@@ -324,12 +334,15 @@ async def workspace_index(workspace_id: str, path: str = ""):
 
 
 @app.post("/workspaces/{workspace_id}/vector-sync")
-async def sync_workspace_vectors(workspace_id: str, extract_relations: bool = Query(default=True)):
+async def sync_workspace_vectors(workspace_id: str, extract_relations: bool = Query(default=True),
+                                 mode: Literal['update', 'retry_failed'] = Query(default='update')):
     try:
-        if extract_relations:
-            result = await asyncio.to_thread(workspace_vector_index.sync, workspace_id)
-        else:
-            result = await asyncio.to_thread(workspace_vector_index.sync, workspace_id, extract_relations=False)
+        options = {}
+        if not extract_relations:
+            options['extract_relations'] = False
+        if mode != 'update':
+            options['mode'] = mode
+        result = await asyncio.to_thread(workspace_vector_index.sync, workspace_id, **options)
         return result.__dict__
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -342,7 +355,8 @@ async def workspace_index_status(workspace_id: str):
     try:
         scan = await asyncio.to_thread(filesystem_provider.sync_index, workspace_id)
         status = await asyncio.to_thread(workspace_vector_index.status, workspace_id)
-        return {**status, 'truncated': scan.truncated, 'scan_errors': len(scan.errors)}
+        return {**status, 'truncated': scan.truncated, 'scan_errors': len(scan.errors),
+                'checked_at': datetime.now(timezone.utc).isoformat()}
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except (ValueError, FileNotFoundError, PermissionError, OSError) as exc:
@@ -418,9 +432,16 @@ async def stream_query_endpoint(query_input: QueryInput):
                 nonlocal task_id
                 task_id = task.id
                 queue.put_nowait({"type": "task", "task_id": task.id})
+            def progress(message):
+                def push():
+                    # Status updates can be coalesced/dropped under backpressure;
+                    # final results and tokens retain their delivery protocol.
+                    if not disconnected.is_set() and not queue.full():
+                        queue.put_nowait({"type":"progress","message":message})
+                loop.call_soon_threadsafe(push)
             response, _ = await assistant_core.process_input(
                 query_input,
-                source="voice" if query_input.live_mode else "text", on_task_started=started,
+                source="voice" if query_input.live_mode else "text", on_task_started=started,on_progress=progress,
             )
             if not streamed:
                 await publish({"type": "stage", "stage": "answering"})
@@ -698,6 +719,7 @@ from assistant_core import AssistantCore
 from assistant_models import AssistantError
 from assistant_repository import AssistantRepository
 from agent_planner import LLMAgentPlanner
+from repository_agent import RepositoryAgentSkill
 from knowledge_skill import KnowledgeSkill, KnowledgeServices
 from fastapi.responses import JSONResponse
 
@@ -719,11 +741,23 @@ assistant_core = AssistantCore(
     )),
     save_history=lambda *a: insert_application_logs(*a),
     workspace_skill=WorkspaceSkill(filesystem_provider, vector_indexer=workspace_vector_index),
+    local_tools_skill=local_tools_skill,
+    repository_agent_skill=RepositoryAgentSkill(filesystem_provider),
     history_loader=lambda session_id: get_chat_history(session_id),
     conversation_resolver=ConversationResolver(),
     agent_planner=LLMAgentPlanner(),
     response_saver=assistant_repository.save_response,
 )
+from conversation_memory import ConversationMemory
+from db_utils import get_chat_archive, get_knowledge_epoch
+from contextlib import closing
+import settings as _context_settings
+
+def _conversation_epoch():
+    with closing(assistant_repository.connection_factory()) as conn:return get_knowledge_epoch(conn)
+
+if _context_settings.CONVERSATION_COMPACTION_ENABLED:
+    assistant_core.conversation_memory=ConversationMemory(assistant_repository,get_chat_archive,_conversation_epoch)
 
 
 @app.exception_handler(AssistantError)

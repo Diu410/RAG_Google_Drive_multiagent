@@ -100,7 +100,7 @@ class ApiTests(unittest.TestCase):
         stopped, full = threading.Event(), threading.Event()
         cancelled = []
 
-        async def process_input(request, *, source, on_task_started):
+        async def process_input(request, *, source, on_task_started, on_progress=None):
             on_task_started(SimpleNamespace(id='disconnect-test'))
             publish = current_token_sink.get()
             def flood():

@@ -28,7 +28,9 @@ def requests_file_open(text: str) -> bool:
     if re.search(r"\b(?:как\s+(?:мне\s+)?откры\w*|how\s+(?:do\s+i|to)\s+open)\b", text):
         return False
     return bool(re.search(r"\b(?:открой(?:те)?|открывай(?:те)?|open)\b|"
-                          r"\b(?:можешь|можете|прошу|хочу|нужно)\s+открыть\b", text))
+                          r"\b(?:можешь|можете|прошу|хочу|нужно)\s+открыть\b|"
+                          r"\bя\s+(?:тебя|вас)\s+(?:уже\s+)?(?:просил|попросил)[аи]?\s+открыть\b|"
+                          r"\bя\s+(?:уже\s+)?(?:просил|попросил)[аи]?\s+(?:тебя|вас)\s+открыть\b", text))
 
 
 def negates_comparison(text: str) -> bool:

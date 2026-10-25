@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
@@ -12,6 +13,51 @@ from model_runtime import get_llm_provider
 class ResolvedQuery(BaseModel):
     standalone_question: str = Field(min_length=1, max_length=32000)
     depends_on_history: bool
+    referent: str = Field(default='',max_length=160,
+        description='Буквальное имя предмета из истории, заменяющее местоимение; без новых свойств.')
+
+
+def strip_dialogue_prefix(question):
+    return re.sub(r'^(?:(?:отлично|хорошо|понятно|спасибо|ладно|ок(?:ей)?)\s*[,!.]?\s*)?'
+                  r'(?:а\s+|и\s+)?', '', question.strip(),count=1,flags=re.I)
+
+
+def asks_history_question(question):
+    text=command_text_for_history(question)
+    if re.search(r'\b(?:по|в|из)\s+(?:документ|файл|источник)\w*',text):return False
+    return bool(re.search(r'^(?:напомни(?:те)?\s*,?\s*(?:что\s+я|о\s+ч[её]м\s+мы|как\s+мы)|'
+        r'что\s+я\s+(?:просил|говорил|запретил|разрешил)|'
+        r'какие\s+(?:ограничения|решения)\s+(?:я|мы)|'
+        r'о\s+ч[её]м\s+мы\s+(?:говорили|договаривались))\b',text))
+
+
+def command_text_for_history(question):
+    from command_intent import command_text
+    return command_text(question).strip()
+
+
+def preserve_question_focus(question, resolved, history):
+    """Resolve a referent without turning a relation question into its cause."""
+    original=strip_dialogue_prefix(question)
+    causal = r'\b(?:почему|зачем|причин\w*|основани\w*)\b'
+    drift = not re.search(causal,original,re.I) and re.search(causal,resolved.standalone_question,re.I)
+    pronouns=r'\b(?:он|она|оно|они|его|е[её]|их|ему|ей|им|н[её]м|ней)\b'
+    if drift or resolved.depends_on_history and re.search(pronouns,original,re.I):
+        referent=resolved.referent.strip()
+        if not referent:
+            # A previous explicit identity question names a topic, not facts
+            # from the assistant's potentially rejected answer.
+            for message in reversed(normalized_history(history)):
+                if message['role']=='user':
+                    match=re.fullmatch(r'(?:кто\s+так(?:ой|ая)|что\s+такое|что\s+знаешь\s+о)\s+(.+?)[?!. ]*',
+                                       message['content'].strip(),re.I)
+                    if match:
+                        referent=match[1];break
+        if referent and any(referent.casefold() in m['content'].casefold() for m in normalized_history(history)):
+            resolved.standalone_question=re.sub(pronouns,referent,original,flags=re.I)
+        else:
+            resolved.standalone_question=original
+    return resolved
 
 
 def _message(message) -> tuple[str, str]:
@@ -22,13 +68,14 @@ def _message(message) -> tuple[str, str]:
 
 def normalized_history(history: list | None, limit: int = 6) -> list[dict[str, str]]:
     messages = []
-    for raw in (history or [])[-limit:]:
+    prepared=bool(history) and all(isinstance(m,dict) and m.get('_context_selected') for m in history)
+    for raw in (history or []) if prepared else (history or [])[-limit:]:
         role, content = _message(raw)
         if not content.strip():
             continue
         messages.append({
             "role": "user" if role.casefold() in {"human", "user"} else "assistant",
-            "content": content[-3000:],
+            "content": content if prepared else content[-3000:],
         })
     return messages
 
@@ -54,7 +101,10 @@ class ConversationResolver:
                     "Определи, зависит ли новый вопрос от предыдущего диалога. Разреши местоимения, "
                     "пропущенные сущности и ссылки вроде «это», «там», «тот человек». Верни самостоятельный "
                     "вопрос, пригодный для поиска по файлам. Не отвечай на вопрос, не добавляй факты и не "
-                    "меняй смысл. Если вопрос самодостаточен или меняет тему, верни его без изменений."
+                    "меняй смысл. Сохрани тип и узость вопроса: «чего/чей/какой» требует предмета или "
+                    "принадлежности, а не причин, оснований, обязанностей или биографии. referent — "
+                    "только буквальное имя из истории. Предыдущий ответ помогает разрешить ссылку, "
+                    "но не является доказательством. Если вопрос самодостаточен или меняет тему, верни его без изменений."
                 ),
             }, {
                 "role": "user",
@@ -68,4 +118,4 @@ class ConversationResolver:
         resolved = ResolvedQuery.model_validate_json(response.text)
         if not resolved.depends_on_history:
             resolved.standalone_question = question
-        return resolved
+        return preserve_question_focus(question,resolved,history)

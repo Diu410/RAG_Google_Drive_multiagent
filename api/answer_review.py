@@ -38,6 +38,11 @@ _SYSTEM = (
     'v=M (MISSING): предложение только сообщает, какие запрошенные сведения не раскрыты в найденных фрагментах. '
     'v=U (UNSUPPORTED): доказательств недостаточно. v=C (CONFLICTING): источник прямо противоречит утверждению. '
     'Не путай неизвестность с отрицанием или противоречием. '
+    'Точное сообщение, что два источника дают разные значения, может быть S: '
+    'расхождение источников не означает противоречия самого сообщения об этом расхождении. '
+    'Логическое следствие явного правила и его условий допускается как S, '
+    'если сохранены все ограничения и процитированы и правило, и необходимые факты. '
+    'Для расчёта выбирай цитаты с названиями колонок, операндами, единицами и фильтром строк. '
     'p=false только для сообщения об отсутствии сведений без добавленных фактов. '
     'В смешанном предложении с фактом p=true; v=M не подтверждает положительный факт. '
     'Проверяй смысл, а не совпадение слов: кто говорит, кому, кто выполняет действие, над чем; '
@@ -87,9 +92,17 @@ def _statements(answer, sources):
         footer_path = re.sub(r'^[*\s]*(?:файл|file)\s+', '', text, flags=re.I).strip(' \t\r\n*`-.')
         if footer_path in paths:
             presentation = True
+        footer = re.fullmatch(r'[*\s]*(?:Источники|Использованные файлы|Sources|Used files)\s*:\s*(.+)',text,re.I)
+        if footer and paths:
+            # A footer may list only actual selected paths. A sentence about
+            # the subject after the label must still undergo factual review.
+            named = '|'.join(re.escape(path) for path in sorted(paths,key=len,reverse=True))
+            path_item = r'[*`\s]*(?:'+named+r')[*`\s]*'
+            if re.fullmatch(path_item+r'(?:[,;]\s*'+path_item+r')*\.?',footer.group(1)):
+                presentation = True
         if re.fullmatch(r'\d+\.', text) and any(answer[offset:].lstrip().startswith(path) for path in paths):
             presentation = True  # Numbered source footer, not a numeric answer.
-        if not presentation and not re.match(r'^[*#\s]*(?:Источники|Sources)\s*:', text, re.I):
+        if not presentation:
             statements[str(len(statements))] = {
                 'text': text, 'paragraph': paragraph, 'start': start, 'end': start + len(text)}
         if '\n\n' in part:
@@ -97,7 +110,7 @@ def _statements(answer, sources):
     return statements
 
 
-def _sources(results):
+def _sources(results, *, contextual_passages=False, focus_text=''):
     from verifier import _verification_parts
     sources, evidence, seen = [], {}, set()
     for result in results:
@@ -106,7 +119,34 @@ def _sources(results):
             continue
         seen.add(chunk_id)
         quotes = {}
-        for part in _verification_parts(factual_source_text(str(result.get('text', ''))), 1):
+        parts, pending = [], ''
+        # Native citation IDs select self-contained literal passages: a heading
+        # alone cannot prove a code, nor a CSV cell without its column meanings.
+        for part in _verification_parts(factual_source_text(str(result.get('text', ''))), 600 if contextual_passages else 1):
+            pending += part
+            if re.fullmatch(r'\s*#{1,6}\s+[^\n]+\s*', pending):
+                continue
+            # Keep a short heading/name attached to its literal neighbour. A
+            # standalone quote below the auditor's minimum cannot be evidence.
+            if len(' '.join(pending.strip(' \t\r\n\"\'«»„“”‘’.,;:…').split())) >= 12:
+                parts.append(pending)
+                pending = ''
+        if pending:
+            if parts:
+                parts[-1] += pending
+            else:
+                parts.append(pending)
+        if contextual_passages and focus_text:
+            from collections import Counter
+            from source_grounding import overview_topic_terms
+            terms=overview_topic_terms(focus_text)
+            if not terms:
+                terms={w[:5] for w in re.findall(r'[а-яёa-z0-9_-]{4,}',focus_text.casefold())}
+            words=[{w[:5] for w in re.findall(r'[а-яёa-z0-9_-]{4,}',part.casefold())} for part in parts]
+            frequency=Counter(w for group in words for w in group)
+            ranked=sorted(enumerate(parts),key=lambda item:-sum(1/frequency[w] for w in words[item[0]]&terms))
+            parts=[part for _,part in ranked]
+        for part in parts:
             text = part.strip()
             if text:
                 key = str(len(evidence))
@@ -139,6 +179,12 @@ def _assess(client, question, statements, sources, evidence, model, *, only=None
             'answer': {key: {'text': value['text'], 'paragraph': value['paragraph']}
                         for key, value in visible.items()},
             'assess_only': selected, 'sources': kept}
+        from evidence_calculations import source_calculations, arithmetic_checks
+        numeric = source_calculations([{'chunk_id':source['chunk_id'],
+            'text':'\n'.join(source['passages'].values())} for source in kept])
+        if numeric:packet['source_calculations'] = numeric
+        arithmetic = arithmetic_checks(' '.join(statements[key]['text'] for key in selected))
+        if arithmetic:packet['arithmetic_checks'] = arithmetic
         if findings:
             packet['previous_findings'] = {key: findings[key] for key in selected if key in findings}
         messages = [{'role': 'system', 'content': _SYSTEM + (
@@ -273,7 +319,13 @@ def _audit_claims(client, question, claims, sources, model, statements, details)
             claim.relevant_to_question = comparison.last_assessment.relevant_to_question
             if not supported:
                 claim.status = 'UNSUPPORTED'
-                claim.note = 'Независимая сверка не подтвердила совпадение участника, действия или модальности цитаты.'
+                claim.note = {
+                    'recipient_binding':'Цитата обращена к адресату; проверь, кому принадлежат действие и обязанность, и сохрани участника.',
+                    'example_only_self_attribute':'Признак взят только из примера для проговаривания. Опиши его как пример в заметке, а не самописание или биографию лица.',
+                    'self_description_from_example':'Это пример самовнушения. Сохрани его рамку вместо приписывания признака названному лицу.',
+                    'self_report_author_conflict':'В источнике явно назван другой автор речи от первого лица. Не приписывай её адресату или соседнему имени.',
+                    'modality_strengthening':'Сохрани исходную модальность: условие, намерение или совет не являются совершившимся фактом.',
+                }.get(comparison.guard_rejection,'Независимая сверка не подтвердила совпадение участника, действия или модальности цитаты.')
     return claims
 
 
@@ -297,10 +349,12 @@ def review_answer(question, answer, results, strategy, model, *, client=None):
         return answer, VerificationResult(status='INSUFFICIENT_INFORMATION',
             checked_answer=answer, review_mode='CONTEXTUAL',
             warning='В ответе нет содержательных утверждений для сверки с источниками.')
-    sources, evidence = _sources(results)
-    details = {'passes': 0, 'edits': [], 'source_count': len(sources)}
+    details = {'passes': 0, 'edits': [], 'source_count': len({s.get('chunk_id') for s in results})}
     try:
         client = client or get_llm_provider()
+        sources, evidence = _sources(results, contextual_passages=getattr(client, 'supports_evidence_ids', False),
+                                     focus_text=question+'\n'+answer)
+        details['source_count'] = len(sources)
         claims, issues, kept = _assess(client, question, statements, sources, evidence, model, details=details)
     except Exception as exc:
         result = unavailable_result(exc).model_copy(update={

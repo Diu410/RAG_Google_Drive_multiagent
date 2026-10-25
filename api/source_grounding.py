@@ -119,6 +119,17 @@ def focused_source_text(question: str, text: str) -> str:
     return '\n[…]\n'.join(selected) if selected else ''
 
 
+def without_suggested_self_examples(text: str) -> str:
+    """Authoring view only: suggested affirmations cannot supply a biography.
+
+    The original source remains available to the reviewer. Explicit requests
+    to describe examples bypass this view at the caller.
+    """
+    suggestion=re.compile(r'\b(?:проговари\w*|повторя\w*|самовнушен\w*|представь\w*)\b',re.I)
+    person=re.compile(r'\b(?:я|меня|мне|мой|моя|мо[её]|I|my)\b',re.I)
+    return '\n'.join(line for line in text.splitlines() if not (suggestion.search(line) and person.search(line)))
+
+
 def explicit_self_designations(text: str) -> list[str]:
     """Literal positive self-identification outside a nearby example/negation."""
     pattern = re.compile(r'\b(?:это\s+(?:всё\s+)?я|Я)\s*[—-]\s*([^.!?\n]{12,180})', re.I)
