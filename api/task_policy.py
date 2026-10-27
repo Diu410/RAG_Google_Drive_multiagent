@@ -3,7 +3,8 @@ from dataclasses import asdict, dataclass
 import re
 
 from command_intent import command_text, requests_file_open
-from local_tool_intent import directory_summary_request, permitted_local_operations, repeated_user_request
+from local_tool_intent import (directory_summary_request, permitted_local_operations, repeated_user_request,
+                               document_search_query, document_search_selection, previous_answer_export)
 from model_profiles import get_profile
 
 
@@ -21,7 +22,15 @@ def classify_task(question, model='BALANCED', workspace=False):
     question=repeated_user_request(question)
     text=command_text(question)
     profile=get_profile(model)
+    from conversation_control import session_announcement_reply
+    if session_announcement_reply(question):
+        return TaskPolicy('SHORT',settings.SHORT_TASK_SECONDS,'Обозначение диалога без поиска и генерации')
     if workspace:
+        if previous_answer_export(question):
+            return TaskPolicy('SHORT',settings.SHORT_TASK_SECONDS,'Экспорт готового ответа без генерации')
+        selection = document_search_selection(question)
+        if document_search_query(question) is not None or selection and selection['operation'] != 'select':
+            return TaskPolicy('SHORT',settings.SHORT_TASK_SECONDS,'Поиск или выбор документа без полного текстового ответа')
         from repository_agent import repository_intent
         if repository_intent(question):
             return TaskPolicy('LONG',settings.LONG_TASK_SECONDS,'Исследование проекта, правки и проверки')

@@ -72,17 +72,22 @@ chat-model-selection.json
 frontend/src-tauri/resources/llama/
 frontend/src-tauri/gen/
 
+# Local documentation, checks, fixtures and isolated experiments.
+# Files stay on disk but are not part of the minimal source distribution.
+/docs/
+/tests/
+/examples/
+/training/
+/scripts/prepare_fortuna_colab.py
+/api/source_ledger.py
+
 # Local evaluation output (may include document excerpts)
-/docs/*-evaluation.json
 /.user-evaluation/
 
 # Training output can contain private data when users extend the starter set.
 /.training-output/
 .fortuna-backups/
 .fortuna-*.tmp
-/training/outputs/
-/training/checkpoints/
-/training/private/
 *.safetensors
 *.pt
 *.pth
@@ -94,5 +99,3 @@ frontend/src-tauri/gen/
 # Local review reports and publication helpers.
 /frontend/scripts/desktop-inspect.mjs
 /scripts/prepare-main.ps1
-/docs/git-publication.md
-/docs/unusual-requests-review.md

@@ -182,6 +182,18 @@ class AssistantRepository:
                 ON CONFLICT(session_id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at''',
                          (session_id, json.dumps(state, ensure_ascii=False), utc_now()))
 
+    def last_document_search(self, session_id):
+        """Latest completed search in this chat; an empty result supersedes old hits."""
+        with closing(self.connection_factory()) as conn:
+            row = conn.execute('''SELECT a.output,a.action_type FROM assistant_actions a
+                JOIN assistant_tasks t ON t.id=a.task_id WHERE t.session_id=?
+                AND a.status='COMPLETED' AND t.status='COMPLETED'
+                AND a.action_type IN ('SEARCH_DOCUMENTS','CLEAR_DOCUMENT_SEARCH')
+                ORDER BY a.completed_at DESC,a.rowid DESC LIMIT 1''', (session_id,)).fetchone()
+        if not row or row['action_type']=='CLEAR_DOCUMENT_SEARCH':
+            return None
+        return json.loads(row['output']).get('data')
+
     def pending_plan(self, session_id):
         with closing(self.connection_factory()) as conn:
             row = conn.execute('SELECT state FROM assistant_pending_plans WHERE session_id=?',

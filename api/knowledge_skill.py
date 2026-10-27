@@ -33,6 +33,9 @@ _GREETING_RE = re.compile(
 
 def _instant_reply(question: str) -> str | None:
     """Messages requiring no document lookup should never wait for an LLM."""
+    from conversation_control import session_announcement_reply
+    if announcement := session_announcement_reply(question):
+        return announcement
     if not _GREETING_RE.fullmatch(question):
         return None
     if re.search(r"\b(?:hello|hi|hey)\b", question, re.IGNORECASE):

@@ -222,9 +222,16 @@ class WorkspaceVectorIndex:
 
     @consistent_read
     def search(self, workspace_id: str, question: str, limit: int = 3,
-               source_scope: WorkspaceSourceScope | None = None) -> list[dict]:
+               source_scope: WorkspaceSourceScope | None = None,
+               score_threshold: float | None = None) -> list[dict]:
         store = self.vectorstore_getter()
         if store is None:
+            return []
+        if score_threshold is not None and not any(
+                item.readable and item.content_hash and item.vector_status == 'INDEXED'
+                and item.vector_hash == item.content_hash
+                and (source_scope is None or source_scope.contains(item.relative_path))
+                for item in self.repository.indexed_files(workspace_id)):
             return []
         IndexTransactions(self.repository.connection_factory).recover({'workspace_collection': store})
         where = {"workspace_id": workspace_id}
@@ -238,7 +245,9 @@ class WorkspaceVectorIndex:
             # Filter before vector selection. Post-filtering top-k alone lets
             # unrelated folders crowd all selected sources out of the result.
             where = {'$and': [where, {'relative_path': {'$in': paths}}]}
-        documents = store.similarity_search(question, k=limit, filter=where)
+        documents = ([doc for doc, _ in store.similarity_search_with_relevance_scores(
+            question, k=limit, filter=where, score_threshold=score_threshold)] if score_threshold is not None else
+            store.similarity_search(question, k=limit, filter=where))
         output = [{
             "path": document.metadata.get("relative_path") or document.metadata.get("source", ""),
             "content": document.page_content, "score": 1.0, "matched": [],

@@ -238,6 +238,21 @@ class AssistantCore:
             resume_file_question = None
             confirmed_steps = set()
             pending = await asyncio.to_thread(self.repository.pending_plan, session.id)
+            from conversation_control import session_announcement_reply
+            announcement = session_announcement_reply(request.question) if not request.graph_selection else None
+            if announcement:
+                # A new dialogue label is neither a file parameter nor approval
+                # of a pending write. Do not compact/rewrite it into a RAG query.
+                await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
+                pending = None
+                precomputed_result = ToolResult(success=True, tool='knowledge', summary='Dialogue announcement',
+                    data={'final': announcement, 'context': '', 'results': [], 'strategy': 'GENERAL_CHAT'})
+            if (precomputed_result is None and self.local_tools_skill and self.workspace_skill and request.workspace_id
+                    and not request.graph_selection):
+                precomputed_result = await self.local_tools_skill.try_document_search(inputs, execution)
+                if precomputed_result is not None:
+                    await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
+                    pending = None
             if request.graph_selection:
                 selection = request.graph_selection
                 if selection.workspace_id != request.workspace_id:
@@ -269,7 +284,7 @@ class AssistantCore:
                     await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
                     pending = None
             if pending and pending.get('kind') == 'local_tool_input':
-                from local_tool_intent import permitted_local_operations
+                from local_tool_intent import permitted_local_operations, local_tool_followup
                 from action_feedback import action_feedback
                 if re.fullmatch(r'(?:нет|отмена|отмени|не надо)[.! ]*',request.question.strip(),re.I):
                     precomputed_result = ToolResult(success=True,tool='local_tools',summary='Cancelled',data={
@@ -278,8 +293,19 @@ class AssistantCore:
                         and not requests_file_open(request.question) and not asks_last_opened_file(request.question)
                         and not action_feedback(request.question)
                         and not permitted_local_operations(request.question)
-                        and not self.local_tools_skill.match(request.question)):
+                        and not self.local_tools_skill.match(request.question)
+                        and local_tool_followup(pending,request.question)):
                     inputs['_local_tool_request'] = pending['question']+'\nУточнение пользователя: '+request.question
+                    inputs['_local_allowed_operations'] = sorted(set(pending.get('allowed_operations',
+                        permitted_local_operations(pending['question']))) & permitted_local_operations(pending['question']))
+                    if pending.get('command'):
+                        command = dict(pending['command'])
+                        slot = pending.get('expected_input')
+                        if slot in {'source_ref','path','content_request'}:
+                            command[slot] = request.question.strip().strip('«»"`')
+                        inputs['_local_command'] = command
+                    if pending.get('previous_answer'):
+                        inputs['_previous_answer'] = pending['previous_answer']
                 await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
                 pending = None
             if pending and pending.get('kind') == 'document_proposal':
@@ -424,7 +450,13 @@ class AssistantCore:
                         'final':f"Последним был открыт файл `{opened['path']}`." if opened else
                             'В этом чате ещё нет успешного открытия файла из выбранной папки.',
                         'context':'','results':[],'strategy':'WORKSPACE_ACTION_STATUS'})
-            direct_context_free=bool(self.conversation_memory and request.workspace_id and (
+            from local_tool_intent import previous_answer_export
+            copy_answer = previous_answer_export(inputs.get('_local_tool_request',request.question))
+            if precomputed_result is None and copy_answer and self.conversation_memory and request.workspace_id:
+                if '_previous_answer' not in inputs:
+                    inputs['_previous_answer'] = await asyncio.to_thread(
+                        self.conversation_memory.literal_previous_answer,session.id,request.workspace_id)
+            direct_context_free=bool(self.conversation_memory and request.workspace_id and (copy_answer or
                 display_file_target(request.question) or open_file_target(request.question)
                 or inputs.get('_workspace_active_file') and references_active_file(request.question)
                 or self.local_tools_skill and self.local_tools_skill.match(request.question)))
@@ -433,7 +465,7 @@ class AssistantCore:
                     view=await asyncio.to_thread(self.conversation_memory.prepare,session.id,request.workspace_id,
                         request.question,request.model.value,execution.progress)
                     history=view.history
-                    inputs['_previous_answer']=view.previous_answer
+                    inputs.setdefault('_previous_answer',view.previous_answer)
                     await asyncio.to_thread(self.repository.update_task_metadata,task,context_memory=view.info)
                     if view.info['compacted']:
                         execution.progress('Контекст сжат, оригиналы сохранены. '+
@@ -441,6 +473,11 @@ class AssistantCore:
                 else:
                     history = await asyncio.to_thread(self.history_loader, session.id)
                 inputs['_chat_history'] = history if self.conversation_memory else history[-6:]
+                from conversation_context import archive_marker_explanation
+                explanation = archive_marker_explanation(request.question,history)
+                if explanation:
+                    precomputed_result = ToolResult(success=True,tool='knowledge',summary='Explain internal marker',
+                        data={'final':explanation,'context':'','strategy':'GENERAL_CHAT'})
                 from conversation_context import asks_history_question
                 if self.conversation_memory and asks_history_question(request.question):
                     inputs['_history_recall']=True
@@ -462,9 +499,11 @@ class AssistantCore:
                 await asyncio.to_thread(self.workspace_skill.filesystem.sync_index, request.workspace_id)
                 named_workspace_query = await asyncio.to_thread(
                     self.workspace_skill.named_file_query, request.question, request.workspace_id)
+            initial_route = route_by_rules(request.question)
             if (precomputed_result is None and resume_plan is None and resume_file_question is None
                     and not direct_workspace_command and not named_workspace_query and not active_file_context
-                    and history and self.conversation_resolver):
+                    and history and self.conversation_resolver
+                    and not (initial_route and initial_route.strategy == QueryStrategy.GENERAL_CHAT)):
                 try:
                     async with execution.action('CONTEXTUALIZE_QUERY') as action:
                         resolved = await asyncio.to_thread(
@@ -569,7 +608,10 @@ class AssistantCore:
                     route = None
                     try:
                         async with execution.action('ROUTE_TOOL', {'question': routing_question}) as action:
-                            if (is_single_information_request(request.question)
+                            if obvious_route and obvious_route.strategy == QueryStrategy.GENERAL_CHAT:
+                                route = WorkspaceRouteDecision(route=WorkspaceRoute.GENERAL_CHAT,
+                                    confidence=1, reason='Разговорная реплика без файловых действий')
+                            elif (is_single_information_request(request.question)
                                     and is_single_information_request(routing_question)
                                     and not requests_document_library(request.question)
                                     and not (obvious_route and obvious_route.strategy == QueryStrategy.GENERAL_CHAT)):
@@ -602,8 +644,8 @@ class AssistantCore:
                     elif not route or route.route.value != 'DOCUMENT_LIBRARY':
                         # A workspace is the default factual source. A mistaken
                         # KNOWLEDGE classification must not skip its document search.
-                        conversational = False
-                        if not route or route.route.value in {'KNOWLEDGE', 'GENERAL_CHAT'}:
+                        conversational = bool(obvious_route and obvious_route.strategy == QueryStrategy.GENERAL_CHAT)
+                        if not conversational and (not route or route.route.value in {'KNOWLEDGE', 'GENERAL_CHAT'}):
                             try:
                                 decision = await asyncio.to_thread(
                                     self.skills.get('knowledge').services.route,

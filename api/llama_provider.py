@@ -43,6 +43,7 @@ class LlamaCppProvider:
     supports_batch_evidence = True
     supports_compact_evidence = True
     supports_evidence_ids = True
+    supports_literal_predicates = True
     def __init__(self, url=SERVER_URL, *, transport=None, manager=None):
         self.url = url.rstrip('/')
         self.transport, self.manager = transport, manager

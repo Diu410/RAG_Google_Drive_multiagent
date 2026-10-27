@@ -197,11 +197,11 @@ def documentary_overview(question: str, sources: list[dict]) -> str | None:
 def is_missing_information_claim(text: str) -> bool:
     """Normalize explicit abstention even when the verifier chose the wrong basis."""
     return bool(re.search(
-        r'\bне\s+(?:указан|раскрыт|раскрыва|назван|называ|предоставлен|найден|сообщ[её]н)\w*\b|'
+        r'\bне\s+(?:указан|раскрыт|раскрыва|назван|называ|предоставлен|найден|сообщ[её]н|описан|объясн[её]н)\w*\b|'
         r'\b(?:нет|недостаточно)\s+(?:данных|сведений|информации)\b|'
         r'\b(?:источник|документ|файл|текст)\w*[^.!?\n]{0,100}\b'
         r'не\s+(?:содерж\w*|привед\w*|упомина\w*)\s+(?:данны|данных|сведени|сведений|информаци|упоминани)\w*\b|'
         r'\b(?:информаци|сведени|данны)\w*[^.!?\n]{0,100}\bотсутств\w*\b|'
         r'\bотсутств\w*\s+(?:в\s+)?(?:предоставленн\w*\s+|найденн\w*\s+)?(?:источник|документ|файл|текст)\w*\b|'
-        r'\b(?:not\s+(?:stated|specified|provided|disclosed|found)|insufficient\s+information|'
+        r'\b(?:not\s+(?:stated|specified|provided|disclosed|found|described|explained)|insufficient\s+information|'
         r'no\s+(?:information|data|evidence)\s+(?:about|on|for))\b', text, re.I))

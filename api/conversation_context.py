@@ -36,6 +36,23 @@ def command_text_for_history(question):
     return command_text(question).strip()
 
 
+def archive_marker_explanation(question, history):
+    """Recover from an old leaked service prefix, not from a real file request."""
+    previous = next((content for role,content in map(_message,reversed(history or []))
+        if role in {'assistant','ai'} and content.strip()), '')
+    marker = re.match(r'^\s*\[Архив\s+(\d+)\]',previous,re.I)
+    if not marker:
+        return None
+    text = command_text_for_history(question)
+    if (re.search(r'\b(?:что\s+за|что\s+(?:это|значит)|почему|зачем|откуда)\b',text)
+            and re.search(r'\b(?:архив|метк\w*)\b',text)
+            and not re.search(r'\.[a-zа-я0-9]{1,10}\b',text)
+            and (not re.search(r'\d+',text) or marker[1] in re.findall(r'\d+',text))):
+        return ('«[Архив '+marker[1]+']» — служебная метка контекста, ошибочно попавшая в мой ответ. '
+            'Она не является названием найденного файла. Извините за путаницу.')
+    return None
+
+
 def preserve_question_focus(question, resolved, history):
     """Resolve a referent without turning a relation question into its cause."""
     original=strip_dialogue_prefix(question)

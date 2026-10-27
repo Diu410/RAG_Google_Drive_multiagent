@@ -83,8 +83,12 @@ _MODALITIES = dict(zip(('F', 'S', 'I', 'C', 'A', 'M', 'E', 'T'),
 _KINDS = {'P': 'PERSON', 'O': 'ORGANIZATION', 'C': 'CONCEPT', 'D': 'DOCUMENT'}
 
 
-def _comparison_schema(compact=False):
+def _comparison_schema(compact=False, literal_predicate=False):
     schema = EvidenceRelation.model_json_schema()
+    if literal_predicate:
+        schema['properties']['source_predicate']['description'] = (
+            'Дословная опорная фраза из выбранной quote, не пересказ claim. '
+            'Несколько дословных фрагментов разделяй символом …; каждый должен присутствовать в quote.')
     schema['additionalProperties'] = False
     schema['required'] = list(schema['properties'])
     for prop in schema['properties'].values():
@@ -455,6 +459,16 @@ class EvidenceAuditor:
         from settings import EVIDENCE_AUDIT_COMPACT
         return EVIDENCE_AUDIT_COMPACT and getattr(self.client, 'supports_compact_evidence', False)
 
+    def literal_predicate(self):
+        return getattr(self.client, 'supports_literal_predicates', False) is True
+
+    def predicate_instructions(self):
+        return ((' source_predicate (sp) — только дословная опорная фраза из выбранной quote/quotes. '
+            'Не копируй сюда пересказ claim: выбери исходные слова, даже если они не подтверждают claim. '
+            'Для нескольких фрагментов используй …; каждый фрагмент должен быть дословным. '
+            'По этим словам сравни весь предикат claim, включая причину, условие и событие. ')
+            if self.literal_predicate() else '')
+
     @staticmethod
     def source_context(text, quote):
         """Keep the actual quote and explicit speaker identity, including EOF.
@@ -501,6 +515,14 @@ class EvidenceAuditor:
             'claim_subject/source_subject, claim_predicate/source_predicate и обе модальности; '
             'затем сравни. Пиши кратко. Предикат включает действие, объект, направление связи, '
             'отрицание и существенные ограничения. Цитата должна доказывать ВСЕ части предложения. '
+            'Описание одного предмета не доказывает, что он тождествен другому обозначению: '
+            'проверь саму связь названий и идентификаторов, а не только сведения после неё. '
+            'Личный совет не является общим правилом организации или условием допуска в неё. '
+            'Описание состояния или самоназвание не доказывает историю его получения; '
+            'для объяснения причины, перехода или условий нужно основание именно этой связи. '
+            'Если утверждение сообщает о расхождении источников, проверь отдельно каждое '
+            'приписанное значение по своему источнику. Разные значения в источниках не '
+            'опровергают сообщение об их расхождении; не требуй одного общего значения. '
             'Контекст источника разрешает ссылки и говорящего, но не заменяет выбранную цитату. '
             'Несколько выбранных цитат могут совместно доказывать сводное сообщение о документах. '
             'Для такого сообщения субъект — документы, а предикат — их содержание или соотношение. '
@@ -538,7 +560,7 @@ class EvidenceAuditor:
         self.guard_rejection = None
         self.guard_adjustment = None
         compact = self.compact_transport()
-        system = self.instructions() + (_wire_instructions() if compact else '')
+        system = self.instructions() + self.predicate_instructions() + (_wire_instructions() if compact else '')
         documentary = is_document_report(claim.text)
         packet = {'claim': claim.text, 'quote': claim.evidence_quote, 'basis': claim.basis,
                              'claim_scope': 'DOCUMENT_REPORT' if documentary else 'WORLD_CLAIM',
@@ -580,7 +602,7 @@ class EvidenceAuditor:
             sources = original_context
         else:
             wire = sources
-        schema = _comparison_schema(compact)
+        schema = _comparison_schema(compact, self.literal_predicate())
         response = self.client.structured_generate(
             profile=model, messages=[{'role': 'system', 'content': system},
                 {'role': 'user', 'content': prefix + json.dumps(wire, ensure_ascii=False) + suffix}],
@@ -604,6 +626,13 @@ class EvidenceAuditor:
             raise ValueError('Evidence audit returned an empty subject')
         if not assessment.claim_predicate.strip() or not assessment.source_predicate.strip():
             raise ValueError('Evidence audit did not compare predicates')
+        if self.literal_predicate():
+            normalize = lambda value: ' '.join(value.strip(' \t\r\n\"\'«»„“”‘’.,;:…').casefold().split())
+            selected = normalize(claim.evidence_quote or '')
+            spans = [normalize(part) for part in re.split(r'\.{3,}|…+', assessment.source_predicate)]
+            if not any(spans) or any(span and span not in selected for span in spans):
+                self.guard_rejection = 'source_predicate_not_in_quote'
+                return False
         if specializes_generic_definition(assessment, claim.evidence_quote):
             self.guard_rejection = 'generic_definition_specialization'
             return False
@@ -624,6 +653,10 @@ class EvidenceAuditor:
             return False
         if assessment.claim_modality == 'FACT' and assessment.source_modality in {'INTENTION', 'CONDITION', 'ADVICE', 'METAPHOR'}:
             self.guard_rejection = 'modality_strengthening'
+            return False
+        if (assessment.claim_modality == 'FACT' and assessment.source_modality == 'SELF_DESCRIPTION'
+                and not is_document_report(claim.text)):
+            self.guard_rejection = 'self_description_strengthening'
             return False
         same_modality = assessment.same_modality
         if (not same_modality and assessment.source_modality == 'SELF_DESCRIPTION'
@@ -695,7 +728,7 @@ class EvidenceAuditor:
                 if values := calculation_hints(source['text']):source['calculation_hints'] = values
             if values := arithmetic_checks(claim.text):packets[-1]['arithmetic_checks'] = values
         compact = self.compact_transport()
-        system = self.instructions() + (_wire_instructions() if compact else '') + (
+        system = self.instructions() + self.predicate_instructions() + (_wire_instructions() if compact else '') + (
             ' Проверь каждый элемент items независимо, только по его собственным sources и quote. '
             'Не используй сведения другого элемента. Верни ровно одну оценку на каждый id; '
             'сохрани id без изменений и заполни все поля сравнения.')
@@ -709,7 +742,7 @@ class EvidenceAuditor:
         count = counter(messages, profile.alias, think)
         if not isinstance(count, int) or count + output + 32 > profile.context_size:
             raise ValueError('Batch evidence does not fit context')
-        relation = _comparison_schema(compact)
+        relation = _comparison_schema(compact, self.literal_predicate())
         relation['required'] = list(relation['properties']) + ['id']
         relation['properties']['id'] = {'type': 'string', 'enum': ['0', '1']}
         for prop in relation['properties'].values():

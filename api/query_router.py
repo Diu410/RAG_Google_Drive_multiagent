@@ -68,7 +68,7 @@ def retrieval_plan(decision: RouteDecision, requested_mode: str | None = None) -
 
 _GENERAL_RE = re.compile(
     r"^\s*(?:привет(?:ик|ствую)?|здравствуй(?:те)?|добрый\s+(?:день|вечер|утро)|"
-    r"спасибо|благодарю|как\s+дела|hello|hi|hey|thanks)\s*[!.?]*\s*$", re.IGNORECASE,
+    r"спасибо|благодарю|как\s+(?:(?:твои|у\s+тебя)\s+)?дела|hello|hi|hey|thanks)\s*[!.?]*\s*$", re.IGNORECASE,
 )
 _GRAPH_RE = re.compile(
     r"\b(?:кто|что|как|чем)\s+(?:связан[аоы]?|участву(?:ет|ют)|относится)|"
@@ -102,7 +102,8 @@ def _comparison_entities(query: str) -> list[str]:
 
 
 def route_by_rules(query: str) -> RouteDecision | None:
-    if _GENERAL_RE.fullmatch(query):
+    from conversation_control import session_announcement_reply
+    if _GENERAL_RE.fullmatch(query) or session_announcement_reply(query):
         return RouteDecision(strategy=QueryStrategy.GENERAL_CHAT, confidence=1.0)
     if _GRAPH_RE.search(query):
         return RouteDecision(strategy=QueryStrategy.GRAPH_QUERY, confidence=0.95, entities=_QUOTED_RE.findall(query))

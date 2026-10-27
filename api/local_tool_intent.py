@@ -17,6 +17,94 @@ _ARTIFACT = r'\b(?:файл|документ|заметк|справк|отч[е
 _FORMAT = re.compile(r'\b(?:'+FORMATS+r')\b', re.I)
 
 
+def previous_answer_export(question):
+    """Literal export of a chat answer, never conversion of an active file."""
+    text = command_text(question).strip()
+    text = re.sub(r'^(?:предпросмотр|предварительно)\s*:?\s*','',text)
+    if requests_unsupported_file_change(question) or re.match(r'^(?:как|объясни|расскажи)\b', text):
+        return None
+    if not re.match(r'^(?:(?:пожалуйста|прошу)\s*,?\s*)?(?:сохрани(?:те)?|запиши(?:те)?|экспортируй(?:те)?)\b', text):
+        return None
+    if not re.search(r'\b(?:этот|предыдущий|последний|твой|свой)\s+ответ\b', text):
+        return None
+    if re.search(r'\b(?:не|перепиши|сократи|дополни|переведи|исправь|переработай|затем|потом)\b', text):
+        return None
+    named = re.search(r'(?:[«"`]([^»"`\n]+\.(?:'+FORMATS+r'))[»"`]|'
+        r'\b(?:файл|документ|именем|назови)\s+([^\n,;:«»"`]+?\.(?:'+FORMATS+r')))(?=\s|$|[.!])', question, re.I)
+    return {'operation':'create_document', 'content_mode':'previous_answer',
+        'path':next(value for value in named.groups() if value) if named else 'Ответ.'+(requested_format(question) or 'md')}
+
+
+def local_tool_followup(pending, reply):
+    """Only a requested parameter can continue authority from an older turn."""
+    from agent_planner import is_single_information_request
+    from query_router import route_by_rules, QueryStrategy
+    text = command_text(reply).strip()
+    if permitted_local_operations(reply) or requests_unsupported_file_change(reply):
+        return False  # A new operation must use its own authorization.
+    route = route_by_rules(reply)
+    if route and route.strategy == QueryStrategy.GENERAL_CHAT:
+        return False
+    slot = pending.get('expected_input','parameters')
+    if slot == 'content_request':
+        return bool(text)  # Here a question is explicitly requested document content.
+    if is_single_information_request(reply) or '?' in text or re.match(r'^(?:как|расскажи|объясни)\b',text):
+        return False
+    format_only = re.fullmatch(r'(?:(?:в|формат|в\s+формате)\s+)?(?:'+FORMATS+r')[.! ]*',text,re.I)
+    if slot == 'format':
+        return bool(format_only)
+    if slot == 'previous_answer':
+        return False  # Do not substitute the clarification itself for a missing original.
+    label = reply.strip().strip('«»"`').rstrip('.! ')
+    filename = re.fullmatch(r'[^\n?<>:"|*]{1,480}\.[a-zA-Z0-9]{1,12}',label)
+    if slot in {'path','parameters'}:
+        return bool(filename or format_only)
+    if slot == 'source_ref':
+        return bool(filename or re.fullmatch(r'[\w /\\.-]{1,160}',label))
+    return False
+
+
+def allowed_local_operations(question, inputs):
+    allowed = permitted_local_operations(question)
+    if '_local_allowed_operations' in inputs:
+        allowed &= set(inputs['_local_allowed_operations'])
+    return allowed
+
+
+def document_search_query(question):
+    """Only a file-discovery goal; analysis and multi-action requests stay normal."""
+    visible = command_text(question).strip()
+    if requests_unsupported_file_change(question):
+        return None
+    if not re.match(r'^(?:(?:пожалуйста|прошу)\s*,?\s*)?(?:найди(?:те)?|отыщи(?:те)?|ищи(?:те)?)\b', visible):
+        return None
+    if re.search(r'\b(?:библиотек\w*|последн\w*|свеж\w*|верс\w*|затем|потом|после\s+этого|'
+                 r'открой\w*|прочитай\w*|покажи\w*|объясни\w*|проанализируй\w*|сравни\w*|создай\w*|'
+                 r'отправь\w*|передай\w*)\b', visible):
+        return None
+    match = re.fullmatch(r'\s*(?:(?:пожалуйста|прошу)\s*,?\s*)?(?:найди(?:те)?|отыщи(?:те)?|ищи(?:те)?)\s+'
+        r'(?:мне\s+)?(?:документ(?:ы)?|файл(?:ы)?)\s*[, :—-]?\s*(.*?)\s*[.!?]*', question, re.I | re.S)
+    if not match:
+        return None
+    query = re.sub(r'^(?:(?:в\s+которо[мйх]|где)\s+(?:(?:описан\w*|указан\w*|изложен\w*|содержатся|есть)\s+)?|'
+                   r'(?:об?|про)\s+)', '', match[1].strip(), flags=re.I).strip().strip('«»"`')
+    return query or None
+
+
+def document_search_selection(question):
+    """An ordinal is resolved from the journal, never from model/chat prose."""
+    match = re.fullmatch(r'\s*(?:(открой(?:те)?|покажи(?:те)?|прочитай(?:те)?)\s+)?'
+        r'(?:(?:файл|документ)\s+)?(первый|второй|третий|четв[её]ртый|пятый|\d+)'
+        r'(?:\s+(?:файл|документ))?\s*[.!?]*', question, re.I)
+    if not match:
+        return None
+    label = match[2].casefold().replace('ё', 'е')
+    ordinal = {'первый':1,'второй':2,'третий':3,'четвертый':4,'пятый':5}
+    return {'index': int(label) if label.isdigit() else ordinal[label],
+            'operation': 'open' if (match[1] or '').casefold().startswith('открой') else
+                         'read' if match[1] else 'select'}
+
+
 def repeated_user_request(question):
     """Explicitly repeating one's own request grants its original authority.
 
@@ -42,6 +130,8 @@ def permitted_local_operations(question):
     unrequested category of mutation. Quoted/negated/educational requests never
     grant a write. A preview request can still prepare an unapplied proposal.
     """
+    if previous_answer_export(question):
+        return {'create_document'}
     text = command_text(question).strip()
     if requests_unsupported_file_change(question) or re.match(
             r'^(?:как\b|объясни\b|что\s+значит\b|расскажи\s+как\b|how\b|explain\b)', text):
@@ -94,7 +184,7 @@ class LocalToolIntent(BaseModel):
 
 
 def resolve_local_intent(question, inputs, catalog):
-    allowed = permitted_local_operations(question)
+    allowed = allowed_local_operations(question, inputs)
     if not allowed:
         return None
     response = model_runtime.get_llm_provider().structured_generate(

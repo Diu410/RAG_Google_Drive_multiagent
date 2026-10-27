@@ -8,6 +8,7 @@ from typing import Optional
 from langchain_core.runnables import RunnableLambda
 from settings import FAST_CONTEXT_CHUNKS
 from model_runtime import create_chat_model, InferenceMode
+from answer_style import ANSWER_STYLE, SOURCED_ANSWER_STYLE
 import logging
 
 logger = logging.getLogger(__name__)
@@ -56,8 +57,7 @@ qa_prompt = ChatPromptTemplate.from_messages([
      "Отделяй сведения текста от осторожных интерпретаций; для выводов указывай текстовую опору. "
      "Если контекст пуст, нерелевантен или не содержит ответа, сообщи, что в локальных документах "
      "недостаточно информации; не пытайся угадать. "
-     "Дай связное объяснение соразмерно вопросу и источникам. Сохраняй полезные детали; "
-     "краткость и подробность выбирай по просьбе пользователя.\n"
+     + SOURCED_ANSWER_STYLE + "\n"
      "Контекст:\n{context}"
      ),
     MessagesPlaceholder(variable_name="chat_history"),
@@ -128,6 +128,9 @@ def get_rag_chain(model=None, search_mode="semantic", result_k=None,
 
 def answer_general_chat(question, chat_history, model=None, live_mode=False):
     """Answer conversational requests without touching document retrieval."""
+    from conversation_control import session_announcement_reply
+    if announcement := session_announcement_reply(question):
+        return announcement
     llm = create_chat_model(model=model, mode=InferenceMode.FAST_CHAT, temperature=0.2)
     prompt = ChatPromptTemplate.from_messages([
         ("system", "Ты Фортуна — умный универсальный помощник на компьютере пользователя. "
@@ -136,6 +139,7 @@ def answer_general_chat(question, chat_history, model=None, live_mode=False):
          "Можно поддерживать беседу, обсуждать предоставленные пользователем сведения, помогать рассуждать и писать "
          "явно творческий текст. Если вопрос требует внешних фактов, которых нет в переписке, честно скажи, что для "
          "надёжного ответа нужен источник; не заполняй пробелы знаниями модели и не делай догадок. " +
+         ANSWER_STYLE +
          ("Это живой голосовой разговор: отвечай естественно одной-двумя короткими фразами, без списков и заголовков."
           if live_mode else "")),
         MessagesPlaceholder(variable_name="chat_history"),

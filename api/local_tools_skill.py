@@ -108,10 +108,11 @@ class LocalToolsSkill:
         return result
 
     async def execute_agent_step(self, operation, inputs, execution):
+        from local_tool_intent import allowed_local_operations
         question = repeated_user_request(inputs.get('_local_tool_request', execution.task.user_input))
-        allowed = permitted_local_operations(question)
+        allowed = allowed_local_operations(question,inputs)
         command = self.match(question)
-        if command:
+        if command and '_local_allowed_operations' not in inputs:
             allowed.add(command['operation'])
         if not allowed or operation not in {'execute', *allowed}:
             raise AssistantError('Операция не разрешена исходным запросом пользователя.', 409)
@@ -119,15 +120,30 @@ class LocalToolsSkill:
         return await self.execute(inputs, execution)
 
     @staticmethod
-    def _clarify(question, inputs, message):
-        pending = {'kind':'local_tool_input','workspace_id':inputs['workspace_id'],'question':question}
+    def _clarify(question, inputs, message, expected_input='parameters', command=None):
+        from local_tool_intent import allowed_local_operations, previous_answer_export
+        allowed = allowed_local_operations(question,inputs)
+        if command:
+            allowed &= {command['operation']}
+        pending = {'kind':'local_tool_input','workspace_id':inputs['workspace_id'],'question':question,
+            'allowed_operations':sorted(allowed), 'expected_input':expected_input,
+            'source_scope':inputs.get('source_scope')}
+        if command:
+            pending['command'] = dict(command)
+        if previous_answer_export(question) or command and command.get('content_mode')=='previous_answer':
+            # Freeze the literal source before another assistant clarification is saved.
+            previous = inputs.get('_previous_answer') or (command or {}).get('text')
+            if previous:
+                pending['previous_answer'] = previous
         return ToolResult(success=True,tool='local_tools',summary='Tool input needed',data={
             'final':message,'context':'','results':[],'strategy':'LOCAL_TOOLS',
             'pending_interaction':pending,'pending_step':pending,'plan_status':'WAITING_FOR_USER'})
 
     async def try_execute(self, inputs, execution):
+        from local_tool_intent import allowed_local_operations, previous_answer_export
         question = repeated_user_request(inputs.get('_local_tool_request', execution.task.user_input))
-        command = self.match(question)
+        command = inputs.get('_local_command') or previous_answer_export(question) or self.match(question)
+        command = dict(command) if command else None
         directory_summary = directory_summary_request(question)
         if directory_summary:
             target=re.search(r'\b(?:создай|создать|сохрани|подготовь)\s+(?:(?:файл|документ)\s+)?'
@@ -136,7 +152,9 @@ class LocalToolsSkill:
             command={'operation':'create_document','content_mode':'answer',
                 'content_request':question,'path':target[1].strip() if target else 'Общий пересказ.md'}
         literal_command = command is not None
-        allowed = permitted_local_operations(question)
+        allowed = allowed_local_operations(question, inputs)
+        if command and command['operation'] not in allowed and '_local_allowed_operations' in inputs:
+            return self._clarify(question,inputs,'Уточнение не разрешает другую операцию. Укажите отдельную новую просьбу.')
         if not command and not allowed:
             return None
         if not command:
@@ -153,6 +171,8 @@ class LocalToolsSkill:
             command = intent.model_dump()
         operation = command['operation']
         if not literal_command and operation not in allowed:
+            if '_local_allowed_operations' in inputs:
+                return self._clarify(question,inputs,'Уточнение не разрешает другую операцию. Укажите отдельную новую просьбу.')
             raise AssistantError('Операция не разрешена исходным запросом пользователя.',409)
         preview = bool(re.search(r'\b(?:предпросмотр|предварительно|не\s+сохраняй|только\s+черновик)\b',
                                  command_text(question)))
@@ -165,19 +185,20 @@ class LocalToolsSkill:
             if not reference or re.fullmatch(r'(?:этот|этого|этой|данный|данного)?\s*(?:документ|документа|файл|файла|заметка|заметки)?|его|е[её]|это',reference.strip(),re.I):
                 reference = inputs.get('_workspace_active_file','')
             if not reference:
-                return self._clarify(question,inputs,'Какой исходный файл использовать? Напишите его имя или относительный путь.')
+                return self._clarify(question,inputs,'Какой исходный файл использовать? Напишите его имя или относительный путь.', 'source_ref', command)
             try:
                 source = await _file_call(self.documents.filesystem.find_text_file,workspace_id,
                     'Прочитай файл '+reference, inputs.get('model'), inputs.get('_workspace_current_directory',''))
             except AssistantError as exc:
                 if exc.status_code==409:
-                    return self._clarify(question,inputs,str(exc))
+                    return self._clarify(question,inputs,str(exc),'source_ref',command)
                 raise
             if operation=='convert_document':
                 target = command.get('target_path') or (command.get('path') if 'source_ref' in command else '')
                 suffix = requested_format(question) or Path(target or '').suffix.lstrip('.')
                 if not suffix:
-                    return self._clarify(question,inputs,'В какой формат преобразовать документ: PDF, DOCX, MD, TXT, HTML, CSV или TSV?')
+                    return self._clarify(question,inputs,'В какой формат преобразовать документ: PDF, DOCX, MD, TXT, HTML, CSV или TSV?',
+                        'format', {**command,'source_ref':source})
                 if not target:
                     target = str(Path(source).with_suffix('.'+suffix)).replace('\\','/')
                 elif Path(target).suffix.lstrip('.').casefold()!=suffix:
@@ -200,13 +221,13 @@ class LocalToolsSkill:
                 previous = [content for role,content in map(_message,inputs.get('_chat_history') or [])
                             if role in {'assistant','ai'} and content.strip()]
                 if not previous and not inputs.get('_previous_answer'):
-                    return self._clarify(question,inputs,'Какой текст сохранить? В этом диалоге ещё нет предыдущего ответа.')
+                    return self._clarify(question,inputs,'Какой текст сохранить? В этом диалоге ещё нет предыдущего ответа.', 'previous_answer', command)
                 # Explicitly copying text is not a new claim that it is factual.
                 command['text'] = inputs.get('_previous_answer') or previous[-1]
             elif mode=='answer':
                 query = command.get('content_request','')
                 if not query:
-                    return self._clarify(question,inputs,'О чём должен быть новый документ?')
+                    return self._clarify(question,inputs,'О чём должен быть новый документ?', 'content_request', command)
                 if directory_summary:
                     from directory_summary import DirectorySummary
                     summary_inputs=dict(inputs)
@@ -235,7 +256,8 @@ class LocalToolsSkill:
             output_format=requested_format(question)
             if output_format and Path(path).suffix and Path(path).suffix.lstrip('.').casefold()!=output_format:
                 if path in question:
-                    return self._clarify(question,inputs,'Имя документа и требуемый формат различаются. Какое расширение использовать?')
+                    return self._clarify(question,inputs,'Имя документа и требуемый формат различаются. Какое расширение использовать?',
+                        'format',command)
                 path=Path(path).with_suffix('.'+output_format).as_posix()
             if not Path(path).suffix:
                 path += '.'+(output_format or 'md')
@@ -263,6 +285,47 @@ class LocalToolsSkill:
         result = await self._run(command,workspace_id,execution)
         result.data.setdefault('current_directory',inputs.get('_workspace_current_directory',''))
         return result
+
+    async def try_document_search(self, inputs, execution):
+        """Called before history compaction; shares the text/Live executor."""
+        from document_finder import DocumentFinder, result
+        from local_tool_intent import document_search_query, document_search_selection
+        question = execution.task.user_input
+        query = document_search_query(question)
+        selection = document_search_selection(question)
+        if query is not None:
+            return await DocumentFinder(self.workspace_skill).execute_search(query, inputs, execution)
+        pending = await asyncio.to_thread(execution.repository.pending_plan, execution.task.session_id)
+        if pending and pending.get('kind') == 'workspace_file_choice':
+            # An unresolved newer file choice takes precedence over an old search.
+            return None
+        if selection is None and re.fullmatch(r'\s*(открой(?:те)?|покажи(?:те)?|прочитай(?:те)?)\s+'
+                r'(?:его|е[её]|этот\s+(?:файл|документ))\s*[.!?]*',question,re.I):
+            if pending:
+                return None
+            state = await asyncio.to_thread(execution.repository.last_document_search, execution.task.session_id)
+            active = inputs.get('_workspace_active_file')
+            index = next((i for i,row in enumerate((state or {}).get('candidates',[]),1) if row['path']==active),None)
+            if index is not None:
+                operation = 'open' if question.strip().casefold().startswith('открой') else 'read'
+                return await DocumentFinder(self.workspace_skill).execute_selection(
+                    {'index':index,'operation':operation},state,inputs,execution)
+        if selection is not None:
+            # Do not steal bare numeric replies from existing pending workflows.
+            if selection['operation']=='select' and pending:
+                return None
+            state = await asyncio.to_thread(execution.repository.last_document_search, execution.task.session_id)
+            if state is None and selection['operation']=='select':
+                return None
+            return await DocumentFinder(self.workspace_skill).execute_selection(selection, state, inputs, execution)
+        if re.fullmatch(r'\s*(?:отмена|отмени\s+поиск|не\s+надо)\s*[.!]*',question,re.I):
+            state = await asyncio.to_thread(execution.repository.last_document_search, execution.task.session_id)
+            if state and not pending:
+                async with execution.action('CLEAR_DOCUMENT_SEARCH') as action:
+                    action.output = {'candidates':[]}
+                selected = inputs.get('_workspace_active_file') in {r['path'] for r in state.get('candidates',[])}
+                return result('Выбор документа отменён.', **({'active_file':''} if selected else {}))
+        return None
 
     async def _compose(self, query, inputs, execution):
         if self.workspace_skill is None:
