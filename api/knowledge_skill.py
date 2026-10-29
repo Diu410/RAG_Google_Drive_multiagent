@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Callable
 from assistant_models import AssistantError, ToolResult
 from pydantic_models import QueryInput
-from query_router import retrieval_plan, QueryStrategy, RouteDecision
+from query_router import retrieval_plan, QueryStrategy, RouteDecision, route_by_rules
 
 
 @dataclass
@@ -58,12 +58,18 @@ class KnowledgeSkill:
         model = query_input.model.value
         retrieval_question = inputs.get('_retrieval_question') or query_input.question
         from conversation_context import asks_history_question
+        from answer_contract import current_contract
+        contract = current_contract.get()
         async with execution.action('ROUTE_QUERY') as action:
             route = (RouteDecision(strategy=QueryStrategy.GENERAL_CHAT, confidence=1.0)
                      if inputs.get('_history_recall') and asks_history_question(query_input.question) else
                      RouteDecision(strategy=QueryStrategy.GRAPH_QUERY, confidence=1.0)
-                     if inputs.get('_graph_focus') else
-                     await asyncio.to_thread(self.services.route, retrieval_question, model))
+                      if inputs.get('_graph_focus') else
+                     (route_by_rules(retrieval_question) or RouteDecision(strategy=QueryStrategy.DOCUMENT_QA,confidence=1))
+                      if contract and contract.source=='LIBRARY' else
+                       await asyncio.to_thread(self.services.route, retrieval_question, model))
+            if contract and contract.source == 'LIBRARY' and route.strategy == QueryStrategy.GENERAL_CHAT:
+                route = RouteDecision(strategy=QueryStrategy.DOCUMENT_QA,confidence=1)
             action.output = {'strategy': route.strategy.value}
         plan = retrieval_plan(
             route, query_input.search_mode.value if query_input.search_mode is not None else None
@@ -97,7 +103,8 @@ class KnowledgeSkill:
                 if chain is None:
                     raise AssistantError('RAG unavailable. Check model provider and Chroma.', 503)
                 chain_response = await asyncio.to_thread(
-                    chain.invoke, {"input": retrieval_question, "chat_history": normalized_history(history)}
+                    chain.invoke, {"input": retrieval_question, "chat_history": [m for m in normalized_history(history)
+                        if not contract or m['role']=='user']}
                 )
                 result = {
                     "final": chain_response["answer"],

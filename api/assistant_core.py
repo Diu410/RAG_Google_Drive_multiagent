@@ -201,6 +201,9 @@ class AssistantCore:
             token = current_scope.set(scope)
             from workspace import workspace_scan_cache
             scan_token = workspace_scan_cache.set({})
+            from answer_contract import current_contract, make_contract
+            contract_token = current_contract.set(make_contract(request.question, request.workspace_id,
+                request.source_scope.model_dump(mode='json') if request.source_scope else None))
             self.active_tasks[task.id] = scope
         try:
             if on_task_started is not None:
@@ -210,6 +213,8 @@ class AssistantCore:
             # Pending state is JSON-persisted. Keep the immutable selection's
             # tuple/list representation identical across confirmation turns.
             inputs['source_scope'] = request.source_scope.model_dump(mode='json') if request.source_scope else None
+            await asyncio.to_thread(self.repository.update_task_metadata, task,
+                                   answer_contract=current_contract.get().as_dict())
             if request.workspace_id and self.workspace_skill:
                 current_directory = await asyncio.to_thread(self.workspace_skill.repository.session_directory,
                     session.id, request.workspace_id
@@ -238,6 +243,40 @@ class AssistantCore:
             resume_file_question = None
             confirmed_steps = set()
             pending = await asyncio.to_thread(self.repository.pending_plan, session.id)
+            from execution_reports import summary_feedback, summary_status, status_result
+            feedback = summary_feedback(request.question) if request.workspace_id and not request.graph_selection else None
+            if feedback:
+                # A new read-only request must not become approval or a missing
+                # filename for an unrelated previous write.
+                await asyncio.to_thread(self.repository.clear_pending_plan, session.id)
+                pending = None
+                from dataclasses import replace
+                current_contract.set(replace(current_contract.get(), source='EXECUTION'))
+                await asyncio.to_thread(self.repository.update_task_metadata,task,
+                                       answer_contract=current_contract.get().as_dict())
+                prior = await asyncio.to_thread(self.repository.last_summary, session.id,
+                                               request.workspace_id, inputs.get('source_scope'))
+                async with execution.action('DESCRIBE_SUMMARY', {'workspace_id':request.workspace_id}) as action:
+                    action.output = {'task_id':prior['task_id'] if prior else None,
+                                     'scope_matches':prior['scope_matches'] if prior else None}
+                if not prior:
+                    precomputed_result = status_result('В журнале этого чата и рабочей папки нет завершённого пересказа для объяснения или продолжения.')
+                elif not prior['scope_matches']:
+                    precomputed_result = status_result('Область источников изменилась. Для продолжения выберите прежнюю область или запросите новый пересказ.')
+                elif feedback == 'describe':
+                    precomputed_result = status_result(summary_status(prior['report']))
+                elif self.local_tools_skill:
+                    report = prior['report']
+                    resume_inputs = {**inputs, '_summary_previous_review':report,
+                        '_summary_exclude':report.get('excluded',[]),
+                        '_summary_source_directory':report.get('directory',''),
+                        '_workspace_current_directory':report.get('directory',''), '_summary_in_chat':True}
+                    from directory_summary import DirectorySummary
+                    text, updated = await DirectorySummary(self.workspace_skill.filesystem).compose(resume_inputs, execution)
+                    async with execution.action('FINALIZE_SUMMARY') as action:action.output = updated
+                    precomputed_result = ToolResult(success=True,tool='workspace',summary='Summary continued',data={
+                        'final':text,'context':'','results':[],'strategy':'WORKSPACE_SUMMARY',
+                        'plan_status':'COMPLETED' if updated['complete'] else 'PARTIAL'})
             from conversation_control import session_announcement_reply
             announcement = session_announcement_reply(request.question) if not request.graph_selection else None
             if announcement:
@@ -450,13 +489,14 @@ class AssistantCore:
                         'final':f"Последним был открыт файл `{opened['path']}`." if opened else
                             'В этом чате ещё нет успешного открытия файла из выбранной папки.',
                         'context':'','results':[],'strategy':'WORKSPACE_ACTION_STATUS'})
-            from local_tool_intent import previous_answer_export
+            from local_tool_intent import previous_answer_export, directory_summary_chat_request
             copy_answer = previous_answer_export(inputs.get('_local_tool_request',request.question))
             if precomputed_result is None and copy_answer and self.conversation_memory and request.workspace_id:
                 if '_previous_answer' not in inputs:
                     inputs['_previous_answer'] = await asyncio.to_thread(
                         self.conversation_memory.literal_previous_answer,session.id,request.workspace_id)
             direct_context_free=bool(self.conversation_memory and request.workspace_id and (copy_answer or
+                directory_summary_chat_request(request.question) or
                 display_file_target(request.question) or open_file_target(request.question)
                 or inputs.get('_workspace_active_file') and references_active_file(request.question)
                 or self.local_tools_skill and self.local_tools_skill.match(request.question)))
@@ -514,10 +554,28 @@ class AssistantCore:
                         )
                         inputs['_retrieval_question'] = resolved.standalone_question
                         inputs['_depends_on_history'] = resolved.depends_on_history
-                        action.output = {'depends_on_history': resolved.depends_on_history}
+                        contract = current_contract.get().resolved(resolved.standalone_question, resolved.referent)
+                        current_contract.set(contract)
+                        await asyncio.to_thread(self.repository.update_task_metadata, task, answer_contract=contract.as_dict())
+                        action.output = {'depends_on_history': resolved.depends_on_history, 'topic':contract.topic}
                 except Exception:
                     logger.warning('Conversation contextualization unavailable; using the original query')
             agent_plan = resume_plan
+            # A failed resolver may not erase the named topic of this same
+            # workspace/selection. Store names only, never old factual prose.
+            contract = current_contract.get()
+            if (precomputed_result is None and not contract.topic and contract.source not in {'CONVERSATION','HISTORY','LIBRARY','EXECUTION'}
+                    and request.workspace_id and not direct_workspace_command and not named_workspace_query
+                    and re.search(r'\b(?:он|она|оно|его|е[её]|ему|ней|н[её]м)\b',request.question,re.I)):
+                topic = await asyncio.to_thread(self.repository.last_answer_topic,session.id,
+                                               request.workspace_id,inputs.get('source_scope'))
+                if topic:
+                    standalone = re.sub(r'\b(?:он|она|оно|его|е[её]|ему|ней|н[её]м)\b',topic,request.question,flags=re.I)
+                    contract = contract.resolved(standalone,topic)
+                    current_contract.set(contract)
+                    inputs['_retrieval_question'] = standalone
+                    inputs['_depends_on_history'] = True
+                    await asyncio.to_thread(self.repository.update_task_metadata,task,answer_contract=contract.as_dict())
             planning_text = inputs.get('_retrieval_question', request.question)
             if not request.graph_selection and self.workspace_skill and request.workspace_id and requests_unsupported_file_change(request.question):
                 precomputed_result = self.workspace_skill.clarification_result(request.workspace_id, unsupported=True)
@@ -525,7 +583,8 @@ class AssistantCore:
             if (agent_plan is None and precomputed_result is None and self.agent_planner
                     and resume_file_question is None and not pending
                     and not (is_single_information_request(request.question)
-                             and is_single_information_request(planning_text))
+                              and is_single_information_request(planning_text))
+                    and current_contract.get().source != 'WORKSPACE'
                     and not (self.workspace_skill and request.workspace_id
                              and (direct_workspace_command or named_workspace_query or active_file_context
                                   or self.workspace_skill.plan(request.question, planning_text)))
@@ -611,7 +670,7 @@ class AssistantCore:
                             if obvious_route and obvious_route.strategy == QueryStrategy.GENERAL_CHAT:
                                 route = WorkspaceRouteDecision(route=WorkspaceRoute.GENERAL_CHAT,
                                     confidence=1, reason='Разговорная реплика без файловых действий')
-                            elif (is_single_information_request(request.question)
+                            elif current_contract.get().source == 'WORKSPACE' or (is_single_information_request(request.question)
                                     and is_single_information_request(routing_question)
                                     and not requests_document_library(request.question)
                                     and not (obvious_route and obvious_route.strategy == QueryStrategy.GENERAL_CHAT)):
@@ -769,8 +828,18 @@ class AssistantCore:
             self.active_tasks.pop(task.id, None)
             current_scope.reset(token)
             workspace_scan_cache.reset(scan_token)
+            current_contract.reset(contract_token)
 
     async def _complete(self,request,session,task,execution,data,started):
+        from answer_contract import current_contract
+        from answer_publication import publish_reviewed_answer
+        data = dict(data)
+        contract = current_contract.get()
+        if data.get('verification') and contract:
+            data['final'], data['verification'] = publish_reviewed_answer(data['final'],data['verification'])
+        if contract and contract.allow_interpretation and data.get('results'):
+            from answer_interpretation import append_interpretation
+            data = await append_interpretation(data, contract, request.model.value, execution)
         # Validate before touching conversation history. This also commits a
         # recoverable timeout as an explicit incomplete result, not an HTTP crash.
         response=QueryResponse(answer=data['final'],session_id=session.id,model=request.model,
@@ -778,7 +847,8 @@ class AssistantCore:
             enhanced=data.get('enhanced',[]),results=data.get('results',[]),strategy=data.get('strategy'),
             verification=data.get('verification'),graph=data.get('graph'),plan_status=data.get('plan_status'),
             pending_step=data.get('pending_step'),task_policy=task.metadata.get('execution_policy'),
-            context_memory=task.metadata.get('context_memory'),source_scope=request.source_scope)
+            context_memory=task.metadata.get('context_memory'),source_scope=request.source_scope,
+            answer_contract=contract.as_dict() if contract else None, interpretation=data.get('interpretation'))
         response.task_id=task.id
         async with execution.action('SAVE_HISTORY'):
             if self.response_saver:await asyncio.to_thread(self.response_saver,request,response,task)

@@ -371,6 +371,7 @@ export default function App() {
       enhanced: string[];
       task_policy?: Message['task_policy'];
       context_memory?: Message['context_memory'];
+      answer_contract?: Message['answer_contract'];interpretation?: Message['interpretation'];
       results?: Message['results'];
       source_scope?: WorkspaceSourceScope;
     };
@@ -496,6 +497,7 @@ export default function App() {
               verification: r.verification,
               graph: r.graph,
                task_policy:r.task_policy,context_memory:r.context_memory,
+               answer_contract:r.answer_contract,interpretation:r.interpretation,
                results:r.results,source_scope:r.source_scope,
               steps: { draft: r.draft, edited: r.edited, enhanced: r.enhanced },
             },
@@ -548,6 +550,7 @@ export default function App() {
       type Result = {answer:string;session_id:string;chat_version?:number;task_id?:string;context:string;
         strategy?:string;verification?:Verification|null;graph?:GraphInfo|null;draft:string;edited:string;enhanced:string[];
         task_policy?:Message['task_policy'];context_memory?:Message['context_memory'];
+        answer_contract?:Message['answer_contract'];interpretation?:Message['interpretation'];
         results?:Message['results'];source_scope?:WorkspaceSourceScope};
       let result: Result | undefined;
       await processAssistantStream<Result>({
@@ -568,6 +571,7 @@ export default function App() {
         role:"assistant",content:r.answer,timestamp:stamp(),reply_to:c.messages.at(-1)?.id,task_id:r.task_id,
         context:r.context,strategy:r.strategy,verification:r.verification,graph:r.graph,
          task_policy:r.task_policy,context_memory:r.context_memory,
+         answer_contract:r.answer_contract,interpretation:r.interpretation,
          results:r.results,source_scope:r.source_scope,
         steps:{draft:r.draft,edited:r.edited,enhanced:r.enhanced},
       }]};
@@ -1123,12 +1127,13 @@ export default function App() {
                 <time>{date(m.timestamp)}</time>
               </div>
               <SafeMarkdown>{m.content}</SafeMarkdown>
+              {m.interpretation?.status==='INTERPRETATION' && <small>Интерпретация модели отделена от сведений источников; проверены её основания, не доказан сам вывод.</small>}
               {m.context_memory && m.context_memory.version>0 && <small>Контекст диалога сжат. Полная история сохранена.</small>}
               {m.task_policy?.kind==='LONG' && <small>Длительная задача · результаты шагов сохранены в журнале.</small>}
-              {(m.strategy === 'REPOSITORY_AGENT' || m.strategy === 'LOCAL_TOOLS') && m.task_id && <RepositoryTaskDetails taskId={m.task_id}/>}
+              {(['REPOSITORY_AGENT','LOCAL_TOOLS','WORKSPACE_SUMMARY','WORKSPACE_ACTION_STATUS'].includes(m.strategy || '') || m.interpretation) && m.task_id && <RepositoryTaskDetails taskId={m.task_id}/>}
               {m.role === "assistant" && m.strategy && (
                 <span className="strategy">
-                  {m.strategy === 'REPOSITORY_AGENT' ? 'Работа с проектом' : m.strategy.replaceAll("_", " ")}
+                  {m.strategy === 'REPOSITORY_AGENT' ? 'Работа с проектом' : m.strategy === 'WORKSPACE_SUMMARY' ? 'Пересказ папки' : m.strategy === 'WORKSPACE_ACTION_STATUS' ? 'Отчёт о действиях' : m.strategy.replaceAll("_", " ")}
                 </span>
               )}
               {m.verification && (
@@ -1221,11 +1226,12 @@ export default function App() {
                 <details>
                   <summary>Как создавался ответ</summary>
                   <p>Черновик до проверки источников; может содержать ошибки.</p>
-                  <SafeMarkdown>{m.steps.draft}</SafeMarkdown>
-                  <SafeMarkdown>{m.steps.edited || ""}</SafeMarkdown>
-                  {m.steps.enhanced?.map((v, n) => (
-                    <SafeMarkdown key={n}>{v}</SafeMarkdown>
-                  ))}
+                  {[m.steps.draft, m.steps.edited, ...(m.steps.enhanced || [])]
+                    .filter((v, n, versions): v is string => typeof v === 'string' && !!v.trim()
+                      && versions.findIndex(candidate => candidate?.trim() === v.trim()) === n)
+                    .map((v, n) => (
+                      <SafeMarkdown key={n}>{v}</SafeMarkdown>
+                    ))}
                 </details>
               )}
               <CopyButton text={m.content} />
@@ -1669,7 +1675,7 @@ export default function App() {
                 <Dialog.Title>Workspace</Dialog.Title>
                 <Dialog.Description>
                   {workspace
-                    ? "Выберите источники для ответа. Просмотр файлов не меняет выбранную область. Действия и место сохранения задаются отдельно."
+                    ? "Источники, файлы и поиск по рабочей папке."
                     : "Выберите папку для текущего рабочего контекста."}
                 </Dialog.Description>
               </div>
@@ -1721,8 +1727,9 @@ export default function App() {
                   "Папка не выбрана"}
               </span>
             </div>
-            {workspace && <div className="source-scope-picker">
-              <p><b>Источники ответа:</b> {sourceScopeLabel(sourceScope)}</p>
+            {workspace && <details className="source-scope-picker">
+              <summary><b>Источники:</b> {sourceScopeLabel(sourceScope)}</summary>
+              <div className="source-scope-options">
               <button type="button" disabled={locked || liveRunning} onClick={() => selectSources({kind:'workspace'})}>
                 Вся рабочая папка
               </button>
@@ -1747,15 +1754,19 @@ export default function App() {
                     selectSources(files.length ? {kind:'files',files} : {kind:'workspace'});
                   }}>Убрать</button>
               </li>)}</ul>}
-            </div>}
+              </div>
+            </details>}
             {workspace && <WorkspaceIndexDetails status={workspaceIndexStatus} result={workspaceIndexResult}
               busy={workspaceIndexBusy} checking={workspaceIndexChecking} disabled={locked || liveRunning || workspaceBusy}
               onRefresh={() => setWorkspaceIndexRefresh(value => value + 1)}
               onRetry={() => void indexWorkspace('retry_failed')} />}
             {workspaceIndexMessage && <p role="status">{workspaceIndexMessage}</p>}
-            {workspace && <p className="workspace-tool-hint">Попросите в чате создать документ по теме,
-              изменить текст или сделать копию в PDF. Для задач с кодом попросите исправление и запуск тестов.
-              Проверки исполняют код выбранного проекта с правами пользователя.</p>}
+            {workspace && <details className="workspace-help">
+              <summary>Действия в чате</summary>
+              <p>Попросите создать документ, изменить текст или сохранить PDF. Для кода — исправить ошибку и запустить тесты.
+                Проверки исполняют код выбранного проекта с вашими правами.</p>
+              <p>Просмотр файлов не меняет источники ответа. Действия и папка сохранения задаются отдельно.</p>
+            </details>}
             {error && <p className="error">{error}</p>}
             {workspaceBusy && <p role="status">Читаю содержимое папки…</p>}
             {workspaceFile ? (

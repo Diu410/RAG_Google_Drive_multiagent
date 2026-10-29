@@ -100,9 +100,15 @@ def get_rag_chain(model=None, search_mode="semantic", result_k=None,
             "[Источник: {source}; chunk: {chunk_id}]\n{page_content}"
         )
         selected_prompt = qa_prompt
+        from answer_contract import current_contract
+        contract = current_contract.get()
+        if contract:
+            selected_prompt = ChatPromptTemplate.from_messages([
+                ('system',qa_prompt.messages[0].prompt.template+contract.instructions()),
+                MessagesPlaceholder(variable_name='chat_history'),('human','{input}')])
         if live_mode:
             selected_prompt = ChatPromptTemplate.from_messages([
-                ("system", qa_prompt.messages[0].prompt.template +
+                ("system", selected_prompt.messages[0].prompt.template +
                  "\nЭто живой голосовой разговор. Ответь естественно и очень коротко: "
                  "обычно одной-двумя фразами, без заголовков, списков и длинного вступления."),
                 MessagesPlaceholder(variable_name="chat_history"),

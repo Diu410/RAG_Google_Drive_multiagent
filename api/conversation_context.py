@@ -18,8 +18,35 @@ class ResolvedQuery(BaseModel):
 
 
 def strip_dialogue_prefix(question):
+    question = re.sub(r'^(?:странно|интересно|забавно|непонятно)'
+        r'(?:\s+(?:это|вс[её]|конечно|очень|как-то)){0,5}\s*[,!.]\s*(?:а\s+|и\s+)?'
+        r'(?=(?:кто|что|чего|чем|кому|кого|кем|как|почему|зачем|откуда|куда|где|когда|како\w*|сколько)\b)',
+        '',question.strip(),count=1,flags=re.I)
     return re.sub(r'^(?:(?:отлично|хорошо|понятно|спасибо|ладно|ок(?:ей)?)\s*[,!.]?\s*)?'
                   r'(?:а\s+|и\s+)?', '', question.strip(),count=1,flags=re.I)
+
+
+def is_narrow_confirmation(question):
+    """A short check of one proposition is not a request to repeat its overview."""
+    text = strip_dialogue_prefix(question)
+    return bool(len(text.split()) <= 12 and text.count('?') == 1
+        and re.match(r'^(?:(?:то\s+есть|значит),?|верно\s+ли,?\s+что|правильно\s+(?:я\s+)?понимаю,?\s+что)\s+\S',text,re.I)
+        and not re.search(r'\b(?:и|или|также|почему|зачем|как|когда|где|подроб\w*|деталь\w*|анализ\w*|'
+            r'объясни\w*|расскажи\w*|сначала|затем|потом|открой\w*|прочитай\w*|найди\w*|'
+            r'сохрани\w*|создай\w*|запиши\w*|удали\w*|переименуй\w*|запусти\w*)\b|[;:\n]',text,re.I))
+
+
+def has_explicit_overview_subject(question):
+    """A named overview subject does not need the previous topic substituted."""
+    match = re.fullmatch(r'(?:кто\s+так(?:ой|ая|ое)|что\s+(?:за|такое)|'
+        r'что\s+(?:(?:ты|вы)\s+)?зна(?:ешь|ете)\s+об?|'
+        r'что\s+(?:можешь|можете)\s+рассказать\s+об?|расскажи(?:те)?\s+об?)\s+(.+?)[?!. ]*',
+        strip_dialogue_prefix(question),re.I)
+    if not match:
+        return False
+    subject = match[1].strip()
+    return bool(subject and not re.search(r'\b(?:он|она|оно|они|его|е[её]|их|ему|ей|им|'
+        r'н[её]м|ней|эт\w*|тот|та|те|так\w*|данн\w*|текущ\w*|предыдущ\w*)\b',subject,re.I))
 
 
 def asks_history_question(question):
@@ -107,7 +134,7 @@ class ConversationResolver:
 
     def resolve(self, question: str, history: list, model: str) -> ResolvedQuery:
         messages = normalized_history(history)
-        if not messages:
+        if not messages or has_explicit_overview_subject(question):
             return ResolvedQuery(standalone_question=question, depends_on_history=False)
         payload = json.dumps(messages, ensure_ascii=False)
         response = get_llm_provider().structured_generate(

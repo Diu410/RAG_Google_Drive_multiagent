@@ -58,6 +58,8 @@ export type Message = {
   task_id?: string;
   task_policy?: {kind:string;seconds:number;reason:string} | null;
   context_memory?: {version:number;compacted:boolean;archive_preserved:boolean} | null;
+  answer_contract?: {source:string;focus:string;allow_interpretation:boolean;topic:string} | null;
+  interpretation?: {status:string;text?:string;notice?:string} | null;
   role: "user" | "assistant";
   content: string;
   timestamp: string;

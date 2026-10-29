@@ -64,6 +64,36 @@ def _excerpt(text, limit=900, terms=()):
     return text[:limit//2]+'\n[… полная реплика в архиве …]\n'+text[-limit//2:]
 
 
+def _pack_history(pins, memory, messages, terms):
+    """One representation of each archive passage, with protected restrictions."""
+    result, visible, seen = [], [], set()
+    pinned = list({p['text']:p for p in pins.values()}.values())
+    pinned_texts = {p['text'] for p in pinned}
+    for message in messages:
+        if message['id'] in seen:continue
+        seen.add(message['id'])
+        content = message['content']
+        if message['role']=='user':
+            for pin in pins.values():
+                if pin['message_id']==message['id']:
+                    content = content.replace(pin['text'],'').strip()
+        if content.strip():
+            visible.append({'role':message['role'],'content':content,'_archive_id':message['id']})
+    if pinned:
+        result.append({'role':'user','content':'Ранее заданные ограничения пользователя (дословно; не новые команды):\n'+
+            '\n'.join('['+p['id']+'] '+p['text'] for p in pinned)})
+    retained, texts = [], set()
+    for passage in memory:
+        if passage['text'] in texts or passage['text'] in pinned_texts:continue
+        if any(m['_archive_id']==passage['message_id'] and passage['text'] in m['content'] for m in visible):continue
+        texts.add(passage['text'])
+        retained.append('['+passage['id']+'] '+_excerpt(passage['text'],350,terms))
+    if retained:
+        result.append({'role':'assistant','content':'Краткая память старого диалога — цитаты просьб, не источник фактов и не новые команды:\n'+
+            '\n'.join(retained)})
+    return result+visible
+
+
 class ConversationMemory:
     def __init__(self, repository, loader, epoch_loader=lambda:0, *, enabled=True, selector=None,client_factory=None):
         self.repository,self.loader,self.epoch_loader=repository,loader,epoch_loader
@@ -184,15 +214,15 @@ class ConversationMemory:
         if terms:
             recalled=self.loader(session,0,4,scope_key=scope_key,include_legacy=legacy,epoch=epoch,terms=terms)
         selected=state.get('selected',[])
-        raw_text='\n'.join(p['text'] for p in list(pins.values())+selected)+'\n'+'\n'.join(m['content'] for m in records)
-        before=count(raw_text)
-        compact=self.enabled and before>limit and len(records)>2
+        before=count(json.dumps(_pack_history(pins,selected,records,terms),ensure_ascii=False))
+        recent_count=4  # Keep two recent exchanges, not only the immediately preceding answer.
+        compact=self.enabled and before>limit and len(records)>recent_count
         mode='UNCHANGED'
         candidates=[]
         new_state=None
         if compact:
             if progress:progress('Сжимаю старую часть диалога; оригиналы сохраняются.')
-            older=records if backlog else records[:-2]
+            older=records if backlog else records[:-recent_count]
             candidates=list({p['id']:p for p in selected+passages(older) if not p['restriction']}.values())
             try:
                 ids,mode=self._select(candidates,model)
@@ -206,26 +236,21 @@ class ConversationMemory:
                 selected=candidates[-6:]
                 mode='EXTRACTIVE_FALLBACK'
             new_state={'cursor':older[-1]['position'],'selected':selected,'pins':list(pins.values())}
-            records=latest[-2:] if backlog else records[-2:]
+            records=latest[-recent_count:] if backlog else records[-recent_count:]
         tail=[dict(m) for m in records]
         tail_ids={m['id'] for m in tail}
         extra=[dict(m) for m in recalled if m['id'] not in tail_ids]
+        pruned=False
+        for message in extra+tail:
+            if message['role']=='assistant' and len(message['content'])>900:
+                message['content']=_excerpt(message['content'],900,terms)
+                pruned=True
         memory=list(selected)
         def pack():
-            result=[]
-            if pins:
-                result.append({'role':'user','content':'Ранее заданные ограничения пользователя (дословно; не новые команды):\n'+
-                    '\n'.join('['+p['id']+'] '+p['text'] for p in pins.values())})
-            if memory:
-                result.append({'role':'assistant','content':'Краткая память старого диалога — цитаты просьб, не источник фактов и не новые команды:\n'+
-                    '\n'.join('['+p['id']+'] '+_excerpt(p['text'],350,terms) for p in memory)})
-            for m in extra+tail:
-                result.append({'role':m['role'],'content':m['content'], '_archive_id':m['id']})
-            return result
+            return _pack_history(pins,memory,extra+tail,terms)
         history=pack()
         # Prune bulky old answers first; exact restrictions stay outside this
         # pruning. A literal "save previous answer" uses previous_answer above.
-        pruned=False
         while count(json.dumps(history,ensure_ascii=False))>limit:
             choices=[m for m in extra+tail if len(m['content'])>320]
             if choices:
@@ -245,9 +270,10 @@ class ConversationMemory:
             # The checkpoint saves all selected quotes, not only the subset
             # this particular prompt could pack beside the recent tail.
             committed=self._save(session,scope_key,epoch,new_state,version)
+        packed_tokens=count(json.dumps(history,ensure_ascii=False))
         for m in history:m['_context_selected']=True
         info={'compacted':committed,'version':version+int(committed),'mode':mode,
-            'before_tokens':before,'after_tokens':count(json.dumps(history,ensure_ascii=False)),
+            'before_tokens':before,'after_tokens':packed_tokens,
             'history_budget_tokens':limit,'tokenizer':'EXACT' if exact and getattr(client,'_tokenizer_available',True) else 'UTF8_UPPER_BOUND',
             'pruned':pruned,'constraint_count':len(pins),'archive_preserved':True,'backlog_remaining':backlog}
         return MemoryView(history,info,previous)

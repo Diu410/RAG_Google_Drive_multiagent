@@ -4,7 +4,8 @@ import re
 
 from command_intent import command_text, requests_file_open
 from local_tool_intent import (directory_summary_request, permitted_local_operations, repeated_user_request,
-                               document_search_query, document_search_selection, previous_answer_export)
+                               document_search_query, document_search_selection, previous_answer_export,
+                               directory_summary_chat_request)
 from model_profiles import get_profile
 
 
@@ -26,6 +27,12 @@ def classify_task(question, model='BALANCED', workspace=False):
     if session_announcement_reply(question):
         return TaskPolicy('SHORT',settings.SHORT_TASK_SECONDS,'Обозначение диалога без поиска и генерации')
     if workspace:
+        from execution_reports import summary_feedback
+        feedback = summary_feedback(question)
+        if feedback == 'describe':
+            return TaskPolicy('SHORT',settings.SHORT_TASK_SECONDS,'Объяснение выполнения по журналу без LLM')
+        if feedback == 'continue':
+            return TaskPolicy('LONG',settings.LONG_TASK_SECONDS,'Продолжение пересказа выбранных источников')
         if previous_answer_export(question):
             return TaskPolicy('SHORT',settings.SHORT_TASK_SECONDS,'Экспорт готового ответа без генерации')
         selection = document_search_selection(question)
@@ -36,6 +43,8 @@ def classify_task(question, model='BALANCED', workspace=False):
             return TaskPolicy('LONG',settings.LONG_TASK_SECONDS,'Исследование проекта, правки и проверки')
         if directory_summary_request(question):
             return TaskPolicy('LONG',settings.LONG_TASK_SECONDS,'Документ по всему содержимому папки')
+        if directory_summary_chat_request(question):
+            return TaskPolicy('LONG',settings.LONG_TASK_SECONDS,'Пересказ выбранных источников в чате')
         operations=permitted_local_operations(question)
         if 'create_document' in operations and re.search(r'\b(?:с\s+текстом|пуст\w*)\b',text):
             return TaskPolicy('SHORT',settings.SHORT_TASK_SECONDS,'Сохранение готового текста без генерации')

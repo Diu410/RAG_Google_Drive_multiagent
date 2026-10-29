@@ -18,12 +18,12 @@ def is_single_information_request(question: str) -> bool:
     requests and any requested operation keep the existing planner path.
     """
     from command_intent import command_text
-    from conversation_context import strip_dialogue_prefix
+    from conversation_context import strip_dialogue_prefix, is_narrow_confirmation
     text = strip_dialogue_prefix(command_text(question)).strip()
     text = re.sub(r'^(?:по\s+(?:документам|файлам|источникам)|согласно\s+(?:документам|файлам))\s*[, :]?\s*',
                   '', text, flags=re.I)
-    if not re.match(r'^(?:кто|кому|кем|кого|ком|что|чему|чем|чего|каков[аоы]?|какой|какая|какое|какие|какую|каких|'
-                    r'сколько|когда|где|почему|зачем|чей|чья|чь[её]|как|'
+    if not is_narrow_confirmation(text) and not re.match(r'^(?:кто|кому|кем|кого|ком|что|чему|чем|чего|каков[аоы]?|какой|какая|какое|какие|какую|каких|'
+                    r'сколько|когда|где|куда|откуда|отчего|почему|зачем|чей|чья|чь[её]|как|'
                     r'(?:можно|нужно|верно|разрешен[оаы]?|подтвержден[оаы]?|допускается|требуется|есть)\s+ли|'
                     r'(?:к|ко|с|со|о|об|от|у|для|про|на|за|перед|между|над|из|при)\s+'
                     r'(?:кому|кем|кого|ком|чему|чем|чего|ч[её]м|како\w*|каки\w*)|'

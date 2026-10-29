@@ -61,6 +61,16 @@ _BROAD_RE = re.compile(
 )
 
 
+def is_narrow_causal_followup(question, contract):
+    return bool(contract and contract.focus=='CAUSE' and contract.topic
+        and len(contract.question.split())<=12 and contract.question.count('?')<=1
+        and not _BROAD_RE.search(question) and not _BROAD_RE.search(contract.question)
+        and re.search(r'\b(?:он|она|оно|они|его|е[её]|их|ему|ей|им)\b',contract.question,re.I)
+        and not _DETAIL_RE.search(question) and not _DETAIL_RE.search(contract.question)
+        and not re.search(r'\b(?:и|также|ещ[её])\b|[,;:\n]\s*(?:кто|что|как|каков\w*|почему|зачем|'
+                          r'когда|где|куда|откуда|отчего|сколько)\b',contract.question,re.I))
+
+
 class ResponseBudgetPlanner:
     """Lets the LLM choose intent-level detail, then enforces physical model limits."""
 
@@ -71,8 +81,19 @@ class ResponseBudgetPlanner:
         if _DETAIL_RE.search(question):
             coverage = ContextCoverage.BROAD if _BROAD_RE.search(question) else ContextCoverage.BALANCED
             return BudgetDecision(detail=AnswerDetail.DETAILED, coverage=coverage, confidence=1,
-                                  reason="Пользователь явно запросил подробный анализ")
-        from conversation_context import strip_dialogue_prefix
+                                   reason="Пользователь явно запросил подробный анализ")
+        from answer_contract import current_contract
+        contract = current_contract.get()
+        if is_narrow_causal_followup(question,contract):
+            return BudgetDecision(detail=AnswerDetail.BRIEF,coverage=ContextCoverage.FOCUSED,
+                confidence=1,reason='Короткое уточнение причины по известному предмету, без повторного обзора')
+        if contract and contract.focus == 'GOAL':
+            return BudgetDecision(detail=AnswerDetail.NORMAL,coverage=ContextCoverage.BALANCED,
+                confidence=1,reason='Вопрос о цели не требует придумывать историю или мотивацию')
+        from conversation_context import strip_dialogue_prefix, is_narrow_confirmation
+        if is_narrow_confirmation(contract.question if contract else question):
+            return BudgetDecision(detail=AnswerDetail.BRIEF,coverage=ContextCoverage.FOCUSED,
+                confidence=1,reason='Короткая проверка одного утверждения, без повторного обзора')
         if len(question.split())<=30 and not _BROAD_RE.search(question) and re.match(r'^(?:чего|чей|чья|чь[её]|чьи|кому|кем|кого|чему)\b',
                                                   strip_dialogue_prefix(question),re.I):
             return BudgetDecision(detail=AnswerDetail.BRIEF,coverage=ContextCoverage.FOCUSED,

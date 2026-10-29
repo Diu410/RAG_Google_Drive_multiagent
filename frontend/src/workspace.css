@@ -9,7 +9,7 @@
   font-size: 9px; opacity: .68; white-space: nowrap; overflow: hidden;
   text-overflow: ellipsis; max-width: 195px; margin-top: 3px;
 }
-.workspace-toolbar { display: flex; align-items: center; gap: 8px; margin: 20px 0 12px; }
+.workspace-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 14px 0 10px; }
 .workspace-toolbar button { display: flex; align-items: center; gap: 7px; }
 .workspace-toolbar span {
   margin-left: auto; min-width: 0; color: #83917c; font-size: 11px;
@@ -32,21 +32,27 @@
   color: #34453a; font: 12px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
-.workspace-index-status{margin:12px 0;font-size:12px;color:#697c69}
-.workspace-index {font-size:12px;margin:12px 0;}
-.workspace-index small {display:block;color:#697c69;line-height:1.5;margin:8px 0;}
+.workspace-index-status{margin:0;font-size:12px;color:#697c69}
+.workspace-index {font-size:12px;margin:10px 0;}
+.workspace-index-bar {display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;}
+.workspace-index-warning {line-height:1.5;margin:6px 0;}
+.workspace-index-warning:empty {display:none;}
 .workspace-index-actions {display:flex;flex-wrap:wrap;gap:8px;}
 .workspace-index-issues {margin:10px 0;}
 .workspace-index-issues summary {cursor:pointer;}
 .workspace-index-issues ul {max-height:180px;overflow:auto;overflow-wrap:anywhere;padding-left:20px;}
 .workspace-index-issues li {padding:4px 0;}
 .workspace-modal{max-height:92vh;overflow:auto}
-.workspace-tool-hint{font-size:12px;color:#697c69;line-height:1.5;margin:12px 0}
+.workspace-help{font-size:12px;color:#697c69;line-height:1.5;margin:8px 0}
+.workspace-help summary{cursor:pointer;}
+.workspace-help p{margin:6px 0;}
 .repository-task {margin-top:12px;max-width:100%;}
 .repository-task summary {cursor:pointer;color:var(--muted);}
 .repository-action {padding:10px 0;border-bottom:1px solid rgba(128,128,128,.2);}
 .repository-action pre {max-height:360px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;}
-.source-scope-picker {padding:12px;border:1px solid #e0e7db;border-radius:10px;margin-bottom:12px;}
+.source-scope-picker {padding:10px 12px;border:1px solid #e0e7db;border-radius:10px;margin-bottom:10px;font-size:12px;overflow-wrap:anywhere;}
+.source-scope-picker summary {cursor:pointer;}
+.source-scope-options {margin-top:8px;}
 .source-scope-picker button {margin:4px;font-size:12px;}
 .source-scope-picker ul {font-size:12px;overflow-wrap:anywhere;}
 .workspace-sources {margin-top:12px;font-size:12px;}

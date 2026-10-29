@@ -15,6 +15,31 @@ import model_runtime
 FORMATS = r'pdf|docx|markdown|md|txt|html|csv|tsv'
 _ARTIFACT = r'\b(?:файл|документ|заметк|справк|отч[её]т|копи|files?|documents?)\w*\b'
 _FORMAT = re.compile(r'\b(?:'+FORMATS+r')\b', re.I)
+_CREATE_ACTION = (r'(?:создай(?:те)?|создать|создавай(?:те)?|составь(?:те)?|составить|'
+                  r'напиши(?:те)?|написать|подготовь(?:те)?|подготовить|оформи(?:те)?|оформить|'
+                  r'сохрани(?:те)?|сохранить|запиши(?:те)?|записать|сделай(?:те)?|сделать|create|write|save)')
+_WANT_OUTPUT = r'(?:нужен|нужна|нужны|хочу|хорошо\s+бы|want|need)'
+_OUTPUT_MODIFIERS = (r'(?:(?:мне|нам|это|его|е[её]|иметь|получить|нов\w*|отдельн\w*|'
+                     r'этот|эту|такой|такую|обычн\w*|текстов\w*|предыдущ\w*|один|одну)\s+){0,5}')
+_OUTPUT_TARGET = (r'(?:файл(?:ы)?|документ(?:ы)?|заметк[ауи]|справк[ауи]|отч[её]т(?:ы)?|копи[юяи]|'
+                  r'files?|documents?|'+FORMATS+r')\b')
+
+
+def _positive_request(text, pattern):
+    for match in re.finditer(pattern, text):
+        before = text[max(0, match.start()-45):match.start()]
+        if (not re.search(r"(?:\bне|\bnot|don't|never)\s+(?:\w+\s+){0,2}$", before)
+                and not re.search(r'\b(?:не|not|never)\b',match.group())):
+            return True
+    return False
+
+
+def _requests_output(text, target):
+    """An output noun belongs to the goal, not merely to its input sources."""
+    direct = r'\b(?:'+_CREATE_ACTION+'|'+_WANT_OUTPUT+r')\s+'+_OUTPUT_MODIFIERS+target
+    destination = (r'\b'+_CREATE_ACTION+r'\b[^.!?;,\n]{0,160}?\s+(?:в|как)\s+'
+                   r'(?:(?:новый|новую|отдельный|отдельную|формате)\s+){0,2}'+target)
+    return _positive_request(text, direct) or _positive_request(text, destination)
 
 
 def previous_answer_export(question):
@@ -40,7 +65,8 @@ def local_tool_followup(pending, reply):
     from agent_planner import is_single_information_request
     from query_router import route_by_rules, QueryStrategy
     text = command_text(reply).strip()
-    if permitted_local_operations(reply) or requests_unsupported_file_change(reply):
+    if (permitted_local_operations(reply) or directory_summary_chat_request(reply)
+            or requests_unsupported_file_change(reply)):
         return False  # A new operation must use its own authorization.
     route = route_by_rules(reply)
     if route and route.strategy == QueryStrategy.GENERAL_CHAT:
@@ -123,6 +149,54 @@ def directory_summary_request(question):
             and bool(re.search(r'\b(?:вс[её]\w*|целиком|полностью|общий|общую)\b', text)))
 
 
+def summary_directory_reference(question):
+    """Separate a folder label from the following task clause, without guessing paths."""
+    match = re.search(r'\b(?:папк[аеиуы]|директори[яию])\s+'
+        r'(?:[«"`]([^»"`]+)[»"`]|([^,;:.!?\n]+))', question, re.I)
+    if not match:
+        return None
+    if match[1]:
+        return match[1].strip()  # Quoted labels may themselves contain action words.
+    label = re.split(r'(?:^|\s+)(?:'+_CREATE_ACTION+
+        r'|перескажи(?:те)?|пересказать|расскажи(?:те)?|рассказать|опиши(?:те)?|описать)\b',
+        match[2], maxsplit=1, flags=re.I)[0].strip()
+    # Only a whole unquoted deictic reference describes the selected folder.
+    # Quoted labels and longer names keep their literal meaning.
+    if re.fullmatch(r'(?:текущ(?:ая|ую|ей)|(?:выбранн|активн|открыт|данн)(?:ая|ую|ой)|'
+                    r'эт(?:а|у|ой))', label, re.I):
+        return None
+    if not label or re.match(r'^(?:назови|содержится|находится|есть|будет|включая|'
+            r'целиком|полностью|кратко|подробно|здесь|тут|с\s+|со\s+|и\s+|'
+            r'документ\w*|файл\w*|пересказ\w*)', label, re.I):
+        return None
+    return label
+
+
+def directory_summary_chat_request(question):
+    """A corpus overview returned in chat, never authorization to save a file."""
+    from source_grounding import requests_document_library
+    question = repeated_user_request(question)
+    text = command_text(question).strip()
+    if (permitted_local_operations(question) or requests_unsupported_file_change(question)
+            or requests_document_library(question)
+            or re.match(r'^(?:как\b|(?:объясни|расскажи)\s*[, :]*\s*как\b|что\s+такое\b|how\b)', text)):
+        return False
+    # Leave single-file questions and requests with other actions on their own routes.
+    if re.search(r'\b(?:открой\w*|открыть|найди\w*|ищи\w*|запусти\w*|запустить|сравни\w*)\b|'
+                 r'\b[^\s«»"`]+\.(?:'+FORMATS+r')\b', text):
+        return False
+    group = re.search(r'\b(?:директори\w*|папк\w*|файл(?:ы|ов|ам|ами|ах)|'
+                      r'документ(?:ы|ов|ам|ами|ах))\b', text)
+    if (not re.search(r'\b(?:файл|документ)(?:ы|ов|ам|ами|ах)\b', text)
+            and re.search(r'\b(?:файл|документ)(?:а|у|ом|е)?\b', text)):
+        return False
+    overview = (r'\b(?:перескажи(?:те)?|пересказать|расскажи(?:те)?|рассказать|опиши(?:те)?|описать)\b|'
+                r'\b(?:составь(?:те)?|напиши(?:те)?|подготовь(?:те)?|сделай(?:те)?|дай(?:те)?|нужен|нужна|хочу)\s+'
+                r'(?:(?:кратк\w*|общ\w*|подробн\w*)\s+){0,2}(?:пересказ|обзор|сводк\w*|резюме)\b|'
+                r'\bо\s+ч[её]м\b|\bчто\s+(?:внутри|содержится|написано)\b')
+    return bool(group and _positive_request(text, overview))
+
+
 def permitted_local_operations(question):
     """Bounded intent gate, not a command grammar or a source-text permission.
 
@@ -137,21 +211,20 @@ def permitted_local_operations(question):
             r'^(?:как\b|объясни\b|что\s+значит\b|расскажи\s+как\b|how\b|explain\b)', text):
         return set()
     def positive(pattern):
-        for match in re.finditer(pattern, text):
-            before = text[max(0, match.start()-45):match.start()]
-            if not re.search(r"(?:\bне|\bnot|don't|never)\s+(?:\w+\s+){0,2}$", before):
-                return True
-        return False
+        return _positive_request(text, pattern)
     artifact = bool(re.search(_ARTIFACT, text) or _FORMAT.search(text)
                     or re.search(r'\.[a-z]{2,5}\b', question, re.I))
     result = set()
-    if artifact and positive(r'\b(?:создай(?:те)?|создать|создавай(?:те)?|составь(?:те)?|составить|'
-                             r'напиши(?:те)?|написать|подготовь(?:те)?|подготовить|оформи(?:те)?|оформить|'
-                             r'сохрани(?:те)?|сохранить|сделай(?:те)?|сделать|'
-                             r'нужен|нужна|нужно|хочу|хорошо\s+бы|create|write|save)\b'):
+    if (_requests_output(text, _OUTPUT_TARGET)
+            or _positive_request(text, r'\b'+_WANT_OUTPUT+r'\s+'+_OUTPUT_MODIFIERS+_ARTIFACT)):
         result.add('create_document')
-    if positive(r'\b(?:конвертируй(?:те)?|конвертировать|преобразуй(?:те)?|преобразовать|convert)\b') or (_FORMAT.search(text) and positive(
-            r'\b(?:перевед\w*|сдела\w*|нужен|нужна|нужно|нужны|хочу|пришли\w*|получить|want|need)\b')):
+    if (positive(r'\b(?:конвертируй(?:те)?|конвертировать|преобразуй(?:те)?|преобразовать|convert)\b')
+            or _requests_output(text, r'(?:'+FORMATS+r')\b')
+            or positive(r'\b(?:переведи(?:те)?|перевести)\b[^.!?;,\n]{0,160}?\s+в\s+'
+                        r'(?:формат(?:е)?\s+)?(?:'+FORMATS+r')\b')
+            or positive(r'\b(?:пришли(?:те)?|получить|нужно)\s+'+_OUTPUT_MODIFIERS+
+                        r'(?:копи\w*\s+в\s+)?(?:'+FORMATS+r')\b')
+            or positive(r'\b'+_WANT_OUTPUT+r'\s+'+_OUTPUT_MODIFIERS+r'копи\w*\s+в\s+(?:'+FORMATS+r')\b')):
         result.add('convert_document')
     if artifact and positive(r'\b(?:замени(?:те)?|заменить|исправь(?:те)?|исправить|'
                              r'отредактируй(?:те)?|отредактировать|поменяй(?:те)?|поменять|replace|edit)\b'):

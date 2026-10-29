@@ -9,7 +9,8 @@ from assistant_models import AssistantError, ToolResult
 from command_intent import command_text
 from file_policy import FilePolicyError
 from local_tool_intent import (permitted_local_operations, resolve_local_intent, requested_format,
-                              document_content_question, directory_summary_request, repeated_user_request)
+                              document_content_question, directory_summary_request, directory_summary_chat_request,
+                              repeated_user_request, summary_directory_reference)
 
 
 _QUOTED = r'(?:«([^»]*)»|"([^"]*)"|`([^`]*)`)'
@@ -145,6 +146,13 @@ class LocalToolsSkill:
         command = inputs.get('_local_command') or previous_answer_export(question) or self.match(question)
         command = dict(command) if command else None
         directory_summary = directory_summary_request(question)
+        if not command and directory_summary_chat_request(question):
+            text, report = await self._compose_directory(question, inputs, execution, chat=True)
+            async with execution.action('FINALIZE_SUMMARY') as action:
+                action.output = report
+            return ToolResult(success=True,tool=self.name,summary='Directory summary in chat',data={
+                'final':text,'context':'','results':[],'strategy':'WORKSPACE_SUMMARY',
+                'plan_status':'COMPLETED' if report['complete'] else 'PARTIAL'})
         if directory_summary:
             target=re.search(r'\b(?:создай|создать|сохрани|подготовь)\s+(?:(?:файл|документ)\s+)?'
                 r'[«"`]?([^\n,;:«»"`]{1,120}?\.(?:md|txt|docx|pdf|html))'
@@ -229,20 +237,7 @@ class LocalToolsSkill:
                 if not query:
                     return self._clarify(question,inputs,'О чём должен быть новый документ?', 'content_request', command)
                 if directory_summary:
-                    from directory_summary import DirectorySummary
-                    summary_inputs=dict(inputs)
-                    scope = await asyncio.to_thread(self.documents.filesystem.find_directory,workspace_id,question)
-                    named_scope=re.search(r'\b(?:в|из|по)\s+(?:всей\s+)?(?:папке|папки|директории)\s+'
-                        r'(?:[«"`]([^»"`]+)[»"`]|([^,;.!?\n]+))',question,re.I)
-                    if not scope and named_scope:
-                        label=(named_scope[1] or named_scope[2]).strip()
-                        if not re.match(r'^(?:назови|содержится|находится|есть|будет|включая|и\s+)',label,re.I):
-                            raise AssistantError('Указанная папка не найдена. Уточните её относительный путь.',404)
-                    if scope:
-                        summary_inputs['_workspace_current_directory']=scope
-                        summary_inputs['_summary_source_directory']=scope
-                    composed=await DirectorySummary(self.documents.filesystem).compose(summary_inputs,execution)
-                    inputs=summary_inputs
+                    composed=await self._compose_directory(question,inputs,execution)
                 else:
                     composed = await self._compose(query, inputs, execution)
                 if isinstance(composed, ToolResult):
@@ -285,6 +280,22 @@ class LocalToolsSkill:
         result = await self._run(command,workspace_id,execution)
         result.data.setdefault('current_directory',inputs.get('_workspace_current_directory',''))
         return result
+
+    async def _compose_directory(self, question, inputs, execution, chat=False):
+        from directory_summary import DirectorySummary
+        summary_inputs=dict(inputs)
+        # Resolve a name next to the folder marker, not incidental topic words
+        # elsewhere in the request (e.g. "странный архив" is not folder "Архив").
+        label=summary_directory_reference(question)
+        if label:
+            scope=await asyncio.to_thread(self.documents.filesystem.find_directory,
+                inputs['workspace_id'],'папка '+label)
+            if not scope:
+                raise AssistantError('Указанная папка не найдена. Уточните её относительный путь.',404)
+            summary_inputs['_workspace_current_directory']=scope
+            summary_inputs['_summary_source_directory']=scope
+        summary_inputs['_summary_in_chat']=chat
+        return await DirectorySummary(self.documents.filesystem).compose(summary_inputs,execution)
 
     async def try_document_search(self, inputs, execution):
         """Called before history compaction; shares the text/Live executor."""
@@ -368,7 +379,10 @@ class LocalToolsSkill:
             if s.get('chunk_id') in check.source_chunk_ids))
         if paths and not re.search(r'(?im)^Источники:',text):
             text += '\n\nИсточники: '+', '.join('`'+path+'`' for path in paths if path)+'.'
-        return text,check.model_dump(mode='json')
+        evidence = check.model_dump(mode='json')
+        evidence['source_snapshots'] = [{'path':s['metadata']['source'],'revision':s['metadata']['revision']}
+            for s in data.get('results',[]) if s.get('metadata',{}).get('revision')]
+        return text,evidence
 
     async def _run(self, command, workspace_id, execution):
         operation = command['operation']
@@ -400,7 +414,14 @@ class LocalToolsSkill:
                                                    command['path'], command['old'], command['new'])
                 else:
                     data = await _file_call(self.documents.prepare_create, workspace_id,
-                                                   command['path'], command['text'])
+                                                    command['path'], command['text'])
+                    evidence = command.get('_document_evidence')
+                    if evidence:
+                        parents = ([{'path':r['path'],'revision':r['revision']} for r in evidence.get('files',[])]
+                            if evidence.get('mode')=='DIRECTORY_SUMMARY' else evidence.get('source_snapshots',[]))
+                        self.documents.attach_provenance(data['proposal_id'],'generated',parents,execution.task.id)
+                    elif command.get('content_mode')=='previous_answer':
+                        self.documents.attach_provenance(data['proposal_id'],'chat_export',task_id=execution.task.id)
                 final = (f"Подготовлен документ `{data['path']}` ({data['bytes']} байт).\n\n" + data['note'])
                 if data['diff']:
                     final += '\n\n```diff\n' + data['diff'] + '\n```'
@@ -440,6 +461,7 @@ class LocalToolsSkill:
         final = f"Сохранён файл `{data['path']}`."
         if data['backup_path']:
             final += f"\n\nРезервная копия: `{data['backup_path']}`."
+        if data.get('provenance_warning'):final += '\n\n'+data['provenance_warning']
         return ToolResult(success=True, tool=self.name, summary='Document saved',
             data={**data, 'final': final, 'context': '', 'results': [], 'strategy': 'LOCAL_TOOLS',
                   'current_directory':'' if Path(data['path']).parent.as_posix()=='.' else Path(data['path']).parent.as_posix(),

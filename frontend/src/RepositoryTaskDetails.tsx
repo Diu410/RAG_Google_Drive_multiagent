@@ -8,6 +8,9 @@ const labels: Record<string,string> = {
   REPOSITORY_EDIT:'Правка файла', REPOSITORY_WRITE:'Новый файл', REPOSITORY_CHECK:'Проверка проекта',
   REPOSITORY_REWRITE:'Правка файла',
   INVENTORY_SUMMARY:'Состав папки', SUMMARIZE_DOCUMENT_PART:'Подготовка пересказа',
+  FINALIZE_SUMMARY:'Охват пересказа',
+  DESCRIBE_SUMMARY:'Объяснение по журналу', INTERPRET_SOURCES:'Интерпретация модели',
+  SYNTHESIZE_DIRECTORY_OVERVIEW:'Краткая картина папки',
   VERIFY_DOCUMENT_PART:'Сверка с источником', REPAIR_DOCUMENT_PART:'Исправление пересказа',
   REUSE_DOCUMENT_SUMMARY:'Сохранённый проверенный раздел',
   CREATE_DOCUMENT:'Подготовка документа', APPLY_DOCUMENT_CHANGE:'Сохранение документа',
@@ -43,11 +46,15 @@ export function RepositoryTaskDetails({taskId}:{taskId:string}) {
     {actions?.filter(action=>labels[action.action_type]).map(action=>{
       const data=(action.output?.data||{}) as Record<string,unknown>;
       const path=typeof data.path==='string'?data.path:typeof action.input.path==='string'?action.input.path:'';
-      const checks=sourceChecks(action.action_type==='REPAIR_DOCUMENT_PART'?data.correction:data.review);
+      const checks=sourceChecks(action.action_type==='INTERPRET_SOURCES'&&Array.isArray(data.premises)
+        ?data.premises.map(claim=>({claim})):action.action_type==='REPAIR_DOCUMENT_PART'?data.correction:data.review);
       return <div key={action.id} className="repository-action">
         <strong>{labels[action.action_type]}</strong>{path&&<> · <code>{path}</code></>}
         {action.status==='FAILED'&&<p>Действие не выполнено.</p>}
+        {action.action_type==='INTERPRET_SOURCES'&&<p>Проверяются основания интерпретации, не доказывается её вывод.</p>}
         {action.action_type==='INVENTORY_SUMMARY'&&Array.isArray(data.sources)&&<p>Документов для пересказа: {data.sources.length}.</p>}
+        {action.action_type==='FINALIZE_SUMMARY'&&<p>Проверенный пересказ: {String(data.covered_files)} из {String(data.total_files)} документов.
+          {data.complete===true?' Все доступные части обработаны.':' Пересказ не завершён; пропуски указаны в ответе.'}</p>}
         {action.action_type==='VERIFY_DOCUMENT_PART'&&<p>{data.status==='SUPPORTED'
           ? 'Пересказ этой части проверен.' : 'Проверка этой части не завершена или содержит замечания.'}</p>}
         {checks.length>0&&<details><summary>Предложения и доказательства</summary>

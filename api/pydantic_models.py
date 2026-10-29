@@ -111,6 +111,8 @@ class QueryResponse(BaseModel):
     task_status: TaskStatus | None = None
     task_policy: dict | None = None
     context_memory: dict | None = None
+    answer_contract: dict | None = None
+    interpretation: dict | None = None
     source_scope: WorkspaceSourceScope | None = None
     actions: list[Action] = Field(default_factory=list)
     events: list[AssistantEvent] = Field(default_factory=list)

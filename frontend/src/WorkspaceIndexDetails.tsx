@@ -31,34 +31,40 @@ export function WorkspaceIndexDetails({status, result, busy, checking, disabled,
   busy: boolean; checking: boolean; disabled: boolean; onRefresh: () => void; onRetry: () => void;
 }) {
   return <section className="workspace-index" aria-label="Поисковый индекс папки">
-    <p className="workspace-index-status" role="status">
-      {busy ? 'Обрабатываю новые и изменённые файлы…' : checking ? 'Проверяю изменения в папке…' :
-        status ? `Проиндексировано ${status.indexed_documents} из ${status.readable_documents} доступных документов.` :
-          'Статус индекса недоступен. Повторите проверку.'}
-      {!!status?.pending_documents && ` Новых: ${status.pending_documents}.`}
-      {!!status?.changed_documents && ` Изменённых: ${status.changed_documents}.`}
-      {!!status?.failed_documents && ` С ошибками: ${status.failed_documents}.`}
-      {!!status?.unavailable_documents && ` Нестабильных при чтении: ${status.unavailable_documents}.`}
-      {(status?.truncated || result?.scan_truncated) && ' Обход ограничен; полный охват папки не подтверждён.'}
-      {!!(status?.scan_errors || result?.scan_errors) && ' Некоторые файлы или папки недоступны.'}
-    </p>
-    {status?.text_index?.enabled && <p>
-      {status.text_index.available ? `Текстовый индекс: ${status.text_index.indexed_documents} из ${status.readable_documents}.` :
-        'Текстовый индекс недоступен — используется чтение файлов при поиске.'}
-      {!!status.text_index.failed_documents && ` Ошибок извлечения: ${status.text_index.failed_documents}.`}
-      {!!result?.text_index?.omitted && ` Не сохранено в текстовом индексе: ${result.text_index.omitted}. Используется чтение при поиске.`}
-    </p>}
-    <div className="workspace-index-actions">
-      <button type="button" onClick={onRefresh} disabled={busy || checking || disabled}>Проверить изменения</button>
-      {!!(status?.failed_documents || status?.text_index?.failed_documents) && <button type="button" onClick={onRetry} disabled={busy || checking || disabled}>
-        Повторить ошибки
-      </button>}
+    <div className="workspace-index-bar">
+      <p className="workspace-index-status" role="status">
+        {busy ? 'Индексирую…' : checking ? 'Проверяю…' :
+          status ? `Индекс: ${status.indexed_documents}/${status.readable_documents}` : 'Индекс недоступен'}
+        {status?.text_index?.enabled && <span>
+          {status.text_index.available ? ` · Текст: ${status.text_index.indexed_documents}/${status.readable_documents}` :
+            ' · Текстовый индекс недоступен'}
+        </span>}
+      </p>
+      <div className="workspace-index-actions">
+        <button type="button" onClick={onRefresh} disabled={busy || checking || disabled}>Проверить изменения</button>
+        {!!(status?.failed_documents || status?.text_index?.failed_documents) && <button type="button" onClick={onRetry} disabled={busy || checking || disabled}>
+          Повторить ошибки
+        </button>}
+      </div>
     </div>
-    <small>Индекс относится ко всей рабочей папке, независимо от выбранных источников ответа.
+    <p className="workspace-index-warning" role="status">
+      {!!status?.pending_documents && `Новых: ${status.pending_documents}. `}
+      {!!status?.changed_documents && `Изменённых: ${status.changed_documents}. `}
+      {!!status?.failed_documents && `С ошибками: ${status.failed_documents}. `}
+      {!!status?.unavailable_documents && `Нестабильных при чтении: ${status.unavailable_documents}. `}
+      {!!status?.text_index?.failed_documents && `Ошибок извлечения: ${status.text_index.failed_documents}. `}
+      {!!result?.text_index?.omitted && `Текст не сохранён: ${result.text_index.omitted}. `}
+      {(status?.truncated || result?.scan_truncated) && 'Обход ограничен. '}
+      {!!(status?.scan_errors || result?.scan_errors) && 'Есть недоступные файлы или папки.'}
+    </p>
+    <details className="workspace-help">
+      <summary>Об индексе{status?.checked_at && ` · проверено ${new Date(status.checked_at).toLocaleTimeString('ru-RU')}`}</summary>
+      <p>Индекс относится ко всей рабочей папке, независимо от выбранных источников ответа.
       Обновление не обрабатывает неизменённые документы заново. Без актуальных embeddings остаётся поиск по словам.
-      Это состояние на момент проверки, не постоянное наблюдение за диском.
-      {status?.checked_at && ` Проверено: ${new Date(status.checked_at).toLocaleTimeString('ru-RU')}.`}
-    </small>
+      Это снимок на момент проверки, не постоянное наблюдение за диском.
+      При недоступном текстовом индексе используется ограниченное чтение файлов во время поиска.
+      Ограниченный обход не подтверждает полный охват папки.</p>
+    </details>
     {!!status?.issues?.length && <details className="workspace-index-issues">
       <summary>Требуют внимания · {status.readable_documents - status.indexed_documents}</summary>
       <ul>{status.issues.map(item => <li key={item.path}><b>{item.path}</b> — {states[item.state] || item.state}</li>)}</ul>

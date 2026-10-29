@@ -172,13 +172,18 @@ def _source_payload(results: Iterable[dict[str, Any]], max_chars: int = 14000) -
     return payload
 
 
-def _verification_parts(answer: str, max_chars: int = 700) -> list[str]:
+def _verification_parts(answer: str, max_chars: int = 700, *, soft_lines: bool = False) -> list[str]:
     """Partition at sentence/line boundaries, preserving every character.
 
     A single long sentence stays intact: cutting a proposition in half could
     turn a qualification or negation into an apparently supported statement.
     """
-    boundaries = [match.end() for match in re.finditer(r'\n+|(?<=[.!?;])\s+', answer)]
+    # Extracted PDF prose wraps at arbitrary columns. Source passages must keep
+    # the whole sentence, not stop before its object, negation or condition.
+    pattern = r'\n[ \t]*\n+|(?<=[.!?;])\s+' if soft_lines else r'\n+|(?<=[.!?;])\s+'
+    inline_quotes = [m.span() for m in re.finditer(r'«[^»\n]{1,240}»|"[^"\n]{1,240}"', answer)]
+    boundaries = [match.end() for match in re.finditer(pattern, answer)
+                  if not any(start < match.start() < end for start,end in inline_quotes)]
     boundaries.append(len(answer))
     parts, start, end = [], 0, 0
     for boundary in boundaries:
@@ -498,6 +503,7 @@ class Verifier:
                     (claim.relevant_to_question and auditor.last_assessment.relevant_to_question))
                 self.audit_records.append({'claim': claim.text, 'supported': supported,
                     'guard_rejection': auditor.guard_rejection, 'guard_adjustment': auditor.guard_adjustment,
+                    'guard_details': getattr(auditor, 'guard_details', None),
                     'relevance_basis': 'direct_topic_description' if direct_description else 'model',
                     **auditor.last_assessment.model_dump()})
                 if not supported:
@@ -571,7 +577,9 @@ class Verifier:
         from source_grounding import focused_source_text
         short_overview = requests_source_overview(question) and len(question) < 180
         if short_overview:
-            repair_sources = [{**s, 'text': focused_source_text(question, s['text'])} for s in repair_sources]
+            repair_sources = [{**s, 'text': focused_source_text(question, s['text'],
+                soft_lines=str((s.get('metadata') or {}).get('source','')).casefold().endswith('.pdf'))}
+                for s in repair_sources]
             repair_sources = [s for s in repair_sources if s['text']]
             if not repair_sources:
                 repair_sources = list(source_by_id.values())

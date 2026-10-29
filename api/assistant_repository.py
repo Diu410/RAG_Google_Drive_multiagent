@@ -200,6 +200,47 @@ class AssistantRepository:
                                (session_id,)).fetchone()
             return json.loads(row['state']) if row else None
 
+    def last_summary(self, session_id, workspace_id, source_scope):
+        from workspace_source_scope import WorkspaceSourceScope
+        def key(value):
+            return WorkspaceSourceScope.model_validate(value).fingerprint() if value is not None else None
+        with closing(self.connection_factory()) as conn:
+            rows = conn.execute('''SELECT a.output,a.task_id,a.action_type FROM assistant_actions a
+                JOIN assistant_tasks t ON t.id=a.task_id WHERE t.session_id=? AND a.status='COMPLETED'
+                AND a.action_type IN ('FINALIZE_SUMMARY','CREATE_DOCUMENT')
+                ORDER BY a.completed_at DESC,a.rowid DESC LIMIT 50''',(session_id,)).fetchall()
+            for row in rows:
+                data = json.loads(row['output']).get('data', {})
+                report = data.get('document_verification', data)
+                if report.get('mode') != 'DIRECTORY_SUMMARY':continue
+                if row['action_type']=='CREATE_DOCUMENT' and data.get('path'):
+                    report['excluded'] = list(dict.fromkeys(report.get('excluded',[])+[data['path']]))
+                inventory = conn.execute("SELECT input FROM assistant_actions WHERE task_id=? AND action_type='INVENTORY_SUMMARY' LIMIT 1",
+                                         (row['task_id'],)).fetchone()
+                if not inventory or json.loads(inventory['input']).get('workspace_id') != workspace_id:continue
+                # The latest task in this workspace wins; do not skip a changed
+                # selection and accidentally resume an older matching task.
+                return {'task_id':row['task_id'],'report':report,
+                        'scope_matches':key(report.get('source_scope')) == key(source_scope)}
+        return None
+
+    def last_answer_topic(self, session_id, workspace_id, source_scope):
+        from workspace_source_scope import WorkspaceSourceScope
+        def key(value):
+            return WorkspaceSourceScope.model_validate(value).fingerprint() if value is not None else None
+        with closing(self.connection_factory()) as conn:
+            rows = conn.execute("SELECT metadata FROM assistant_tasks WHERE session_id=? AND status='COMPLETED' ORDER BY completed_at DESC,rowid DESC LIMIT 20",
+                                (session_id,)).fetchall()
+        for row in rows:
+            contract = json.loads(row['metadata']).get('answer_contract',{})
+            if not contract:continue
+            if contract.get('workspace_id') != workspace_id:return ''
+            if key(contract.get('source_scope')) != key(source_scope):return ''
+            if contract.get('source') == 'WORKSPACE' and contract.get('topic'):
+                return contract['topic']
+            if contract.get('source') not in {'CONVERSATION','EXECUTION'}:return ''
+        return ''
+
     def clear_pending_plan(self, session_id):
         with closing(self.connection_factory()) as conn, conn:
             conn.execute('DELETE FROM assistant_pending_plans WHERE session_id=?', (session_id,))

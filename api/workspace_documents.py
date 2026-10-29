@@ -13,6 +13,7 @@ import io
 import os
 from pathlib import Path, PureWindowsPath
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -103,6 +104,11 @@ class WorkspaceDocuments:
         self.filesystem = filesystem
         self._proposals = OrderedDict()
         self._lock = threading.RLock()
+        from artifact_origins import ArtifactOrigins
+        try:
+            self.origins = ArtifactOrigins(filesystem.repository.connection_factory)
+        except (OSError, sqlite3.DatabaseError):
+            self.origins = None
 
     def _root(self, workspace_id):
         return Path(self.filesystem.repository.get(workspace_id).root_path).resolve(strict=True)
@@ -220,9 +226,15 @@ class WorkspaceDocuments:
         raw = convert_text(text, Path(target_path).suffix.casefold())
         if file_revision(source) != revision:
             raise AssistantError('Исходник изменился. Повторите конвертацию.', 409)
-        return self._remember(workspace_id, target_path, raw,
+        preview = self._remember(workspace_id, target_path, raw,
             source=(source.relative_to(root).as_posix(), revision),
             note='Конвертация извлечённого текста. Оформление, изображения и структура таблиц не сохраняются.')
+        self.attach_provenance(preview['proposal_id'],'conversion',[{'path':source_path,'revision':revision}])
+        return preview
+
+    def attach_provenance(self, proposal_id, kind, parents=(), task_id=None):
+        with self._lock:
+            self._proposals[proposal_id]['provenance'] = {'kind':kind,'parents':list(parents),'task_id':task_id}
 
     def apply(self, workspace_id, proposal_id):
         with self._lock:
@@ -237,6 +249,11 @@ class WorkspaceDocuments:
             if (stat.st_dev, stat.st_ino) != proposal['root_identity']:
                 raise AssistantError('Рабочая папка изменилась. Подготовьте предпросмотр заново.', 409)
             target = self._target(root, proposal['path'])
+            provenance = proposal.get('provenance')
+            if provenance:
+                for parent in provenance['parents']:
+                    if file_revision(self.filesystem._resolve(root,parent['path'])) != parent['revision']:
+                        raise AssistantError('Источник изменился после подготовки документа. Повторите запрос.',409)
             if proposal['source']:
                 source, revision = proposal['source']
                 if file_revision(self.filesystem._resolve(root, source)) != revision:
@@ -275,6 +292,15 @@ class WorkspaceDocuments:
             finally:
                 temporary.unlink(missing_ok=True)
             self._proposals.pop(proposal_id)
+            provenance_warning = None
+            if provenance:
+                try:
+                    if self.origins is None:raise RuntimeError('Provenance storage unavailable')
+                    self.origins.save(workspace_id,proposal['path'],file_revision(target),**provenance)
+                except Exception:
+                    # Publication already happened: never report an absent file
+                    # or retry the write after a separate metadata failure.
+                    provenance_warning = 'Файл сохранён, но происхождение не удалось записать; оно остаётся неизвестным.'
             from workspace import workspace_scan_cache
             cache = workspace_scan_cache.get()
             if cache is not None:
@@ -282,7 +308,8 @@ class WorkspaceDocuments:
             return {'path': proposal['path'], 'bytes': len(proposal['raw']),
                     'operation': proposal['preview']['operation'],
                     'backup_path': backup.relative_to(root).as_posix() if backup else None,
-                    'note': proposal['preview']['note'], 'applied': True}
+                    'note': proposal['preview']['note'], 'applied': True,
+                    **({'provenance_warning':provenance_warning} if provenance_warning else {})}
 
 
 def _is_utf8(raw):

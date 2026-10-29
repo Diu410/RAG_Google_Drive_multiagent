@@ -7,7 +7,7 @@ def command_text(text: str) -> str:
 
 
 def requests_unsupported_file_change(text: str) -> bool:
-    if not re.search(r'\b(?:файл|папк|директор|files?|folders?|director(?:y|ies))\w*\b|'
+    if not re.search(r'\b(?:файл|документ|заметк|папк|директор|files?|documents?|notes?|folders?|director(?:y|ies))\w*\b|'
                      r'\b[^\s]+\.(?:md|txt|pdf|docx|json|ya?ml|py|js|ts|csv)\b', text, re.IGNORECASE):
         return False
     text = command_text(text)

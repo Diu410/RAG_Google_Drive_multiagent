@@ -40,6 +40,7 @@ def append_response(conn, request, response):
         'reply_to': request_id, 'task_id': response.task_id,
         'context': response.context, 'strategy': response.strategy,
         'task_policy':response.task_policy,'context_memory':response.context_memory,
+        'answer_contract':response.answer_contract,'interpretation':response.interpretation,
         'verification': response.verification.model_dump(mode='json') if response.verification else None,
         'graph': response.graph,
         'results': [item.model_dump(mode='json') for item in response.results],
